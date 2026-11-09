@@ -69,6 +69,9 @@ impl Hints {
             text.push_str(&format!("{address:08X}\n"));
         }
         let partial = self.path.with_extension("hints.new");
+        // the Wii U's filesystem won't rename over a file that's there
+        #[cfg(target_vendor = "wiiu")]
+        let _ = std::fs::remove_file(&self.path);
         match std::fs::write(&partial, text).and_then(|()| std::fs::rename(&partial, &self.path)) {
             Ok(()) => self.saved = self.seen.len(),
             Err(error) => log::warn!("could not write {}, {error}", self.path.display()),

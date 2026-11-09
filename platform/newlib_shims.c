@@ -55,35 +55,85 @@ ssize_t getrandom(void *buffer, size_t length, unsigned int flags) {
    weak __syscall_tls_* hooks, which wut leaves out, so without these keys
    fail with ENOSYS. Rust's std (has-thread-local false on this target) keeps
    every thread_local! behind a pthread key, and aborts when it can't make
-   one. Each thread's values live in an array hung off one of coreinit's
-   per-thread specific slots. Destructors are kept but, as nothing tells us
-   a thread ended, not run: a thread's values leak when it exits, which the
-   runtime's few long-lived threads make harmless. */
+   one.
+
+   Each thread's values live in an array hung off one of coreinit's
+   per-thread slots (13; wut keeps 14 and 15). Every key carries a
+   generation, bumped when it's deleted, so a reused key reads NULL on
+   threads that set the old one, as POSIX wants. Destructors run when a
+   thread ends, from a cleanup callback chained in front of whichever the
+   thread had (wut's reent cleanup chains the same way). */
 #include <stdlib.h>
+#include <coreinit/spinlock.h>
 #include <coreinit/thread.h>
 
 #define ZW_TLS_KEYS 256
 #define ZW_TLS_SLOT OS_THREAD_SPECIFIC_13
+/* POSIX's PTHREAD_DESTRUCTOR_ITERATIONS */
+#define ZW_TLS_DESTRUCTOR_PASSES 4
 
-static volatile int tls_lock;
+typedef struct TlsThread {
+    OSThreadCleanupCallbackFn previous;
+    void *values[ZW_TLS_KEYS];
+    uint32_t generations[ZW_TLS_KEYS];
+} TlsThread;
+
+static OSSpinLock tls_lock;
+
+/* a zeroed OSSpinLock is already an unlocked one; this makes it explicit,
+   before main, if the startup code runs constructors */
+__attribute__((constructor)) static void tls_init(void) {
+    OSInitSpinLock(&tls_lock);
+}
 static uint8_t tls_used[ZW_TLS_KEYS];
+static uint32_t tls_generation[ZW_TLS_KEYS];
 static void (*tls_destructors[ZW_TLS_KEYS])(void *);
 
 static void tls_acquire(void) {
-    while (__atomic_test_and_set((void *)&tls_lock, __ATOMIC_ACQUIRE)) OSYieldThread();
+    OSUninterruptibleSpinLock_Acquire(&tls_lock);
 }
 
 static void tls_release(void) {
-    __atomic_clear((void *)&tls_lock, __ATOMIC_RELEASE);
+    OSUninterruptibleSpinLock_Release(&tls_lock);
 }
 
-static void **tls_values(int create) {
-    void **values = (void **)OSGetThreadSpecific(ZW_TLS_SLOT);
-    if (!values && create) {
-        values = calloc(ZW_TLS_KEYS, sizeof *values);
-        if (values) OSSetThreadSpecific(ZW_TLS_SLOT, values);
+static void tls_cleanup(OSThread *thread, void *stack) {
+    TlsThread *tls = (TlsThread *)OSGetThreadSpecific(ZW_TLS_SLOT);
+    OSThreadCleanupCallbackFn previous = tls ? tls->previous : NULL;
+    if (tls) {
+        for (int pass = 0; pass < ZW_TLS_DESTRUCTOR_PASSES; pass++) {
+            int ran = 0;
+            for (uint32_t k = 1; k < ZW_TLS_KEYS; k++) {
+                void *value = tls->values[k];
+                if (!value) continue;
+                tls_acquire();
+                void (*destructor)(void *) =
+                    (tls_used[k] && tls->generations[k] == tls_generation[k]) ? tls_destructors[k] : NULL;
+                tls_release();
+                tls->values[k] = NULL;
+                if (destructor) {
+                    destructor(value);
+                    ran = 1;
+                }
+            }
+            if (!ran) break;
+        }
+        OSSetThreadSpecific(ZW_TLS_SLOT, NULL);
+        free(tls);
     }
-    return values;
+    if (previous) previous(thread, stack);
+}
+
+static TlsThread *tls_thread(int create) {
+    TlsThread *tls = (TlsThread *)OSGetThreadSpecific(ZW_TLS_SLOT);
+    if (!tls && create) {
+        tls = calloc(1, sizeof *tls);
+        if (tls) {
+            OSSetThreadSpecific(ZW_TLS_SLOT, tls);
+            tls->previous = OSSetThreadCleanupCallback(OSGetCurrentThread(), tls_cleanup);
+        }
+    }
+    return tls;
 }
 
 int __syscall_tls_create(uint32_t *key, void (*destructor)(void *)) {
@@ -107,20 +157,25 @@ int __syscall_tls_delete(uint32_t key) {
     tls_acquire();
     tls_used[key] = 0;
     tls_destructors[key] = NULL;
+    tls_generation[key]++;
     tls_release();
     return 0;
 }
 
 void *__syscall_tls_get(uint32_t key) {
     if (key == 0 || key >= ZW_TLS_KEYS) return NULL;
-    void **values = tls_values(0);
-    return values ? values[key] : NULL;
+    TlsThread *tls = tls_thread(0);
+    if (!tls) return NULL;
+    /* a value set under a deleted key's generation is gone; generation
+       reads are word-sized and only change on delete */
+    return tls->generations[key] == tls_generation[key] ? tls->values[key] : NULL;
 }
 
 int __syscall_tls_set(uint32_t key, const void *value) {
     if (key == 0 || key >= ZW_TLS_KEYS) return EINVAL;
-    void **values = tls_values(1);
-    if (!values) return ENOMEM;
-    values[key] = (void *)value;
+    TlsThread *tls = tls_thread(1);
+    if (!tls) return ENOMEM;
+    tls->values[key] = (void *)value;
+    tls->generations[key] = tls_generation[key];
     return 0;
 }

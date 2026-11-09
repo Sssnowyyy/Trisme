@@ -100,6 +100,8 @@ uint32_t zakuro_wiiu_message(char *buffer, uint32_t size);
 /* the main thread is alive and in the foreground; the console pauses when
    this stops coming, as it does in the HOME menu. */
 void zakuro_wiiu_heartbeat(void);
+/* holds the console still (1) or lets it go on (0), for the HOME menu */
+void zakuro_wiiu_pause(int32_t paused);
 void zakuro_wiiu_stop(void);
 
 /* platform side (C), called by the runtime */

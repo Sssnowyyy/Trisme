@@ -15,6 +15,7 @@
 #include <SDL.h>
 #include <SDL_test_font.h>
 
+#include <coreinit/core.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
 #include <padscore/kpad.h>
@@ -66,6 +67,9 @@ void zw_platform_thread_setup(int32_t core) {
     };
     if (core >= 0 && core <= 2) {
         OSSetThreadAffinity(OSGetCurrentThread(), affinity[core]);
+        /* a running thread moves at its next reschedule */
+        OSYieldThread();
+        WHBLogPrintf("console thread on core %u (asked for %d)", OSGetCoreId(), core);
     }
 }
 
@@ -168,6 +172,11 @@ static void add_stick(float *x, float *y, float sx, float sy) {
 
 static VPADStatus vpad;
 static int vpad_valid;
+/* each Wii Remote channel's last sample, kept through polls with none new */
+static KPADStatus kpad[4];
+static int kpad_valid[4];
+/* the last touch coordinate the panel vouched for, per axis */
+static float touch_last_x, touch_last_y;
 
 /* polls every controller; *cycle_layout is set on a fresh R3 press */
 static void poll_input(ZwInput *input, const ZwLayoutPlan *plan, int *cycle_layout) {
@@ -193,10 +202,13 @@ static void poll_input(ZwInput *input, const ZwLayoutPlan *plan, int *cycle_layo
 
         VPADTouchData touch;
         VPADGetTPCalibratedPoint(VPAD_CHAN_0, &touch, &vpad.tpNormal);
-        if (touch.touched && touch.validity == VPAD_VALID) {
-            /* calibrated points come in a 1280 x 720 space over the panel */
-            float px = touch.x * (float)DRC_WIDTH / 1280.0f;
-            float py = touch.y * (float)DRC_HEIGHT / 720.0f;
+        if (touch.touched) {
+            /* calibrated points come in a 1280 x 720 space over the panel; an
+               axis the panel flags invalid, as it does near the edges, keeps
+               its last good value */
+            if (!(touch.validity & VPAD_INVALID_X)) touch_last_x = touch.x * (float)DRC_WIDTH / 1280.0f;
+            if (!(touch.validity & VPAD_INVALID_Y)) touch_last_y = touch.y * (float)DRC_HEIGHT / 720.0f;
+            float px = touch_last_x, py = touch_last_y;
             if (zw_layout_touch(plan, DRC_WIDTH, DRC_HEIGHT, px, py, &input->touch_x, &input->touch_y)) {
                 input->touching = 1;
             }
@@ -204,10 +216,19 @@ static void poll_input(ZwInput *input, const ZwLayoutPlan *plan, int *cycle_layo
     }
 
     for (int channel = 0; channel < 4; channel++) {
-        KPADStatus status;
+        KPADStatus fresh_status;
         KPADError kerror = KPAD_ERROR_OK;
-        memset(&status, 0, sizeof status);
-        if (KPADReadEx((KPADChan)channel, &status, 1, &kerror) == 0 || kerror != KPAD_ERROR_OK) continue;
+        memset(&fresh_status, 0, sizeof fresh_status);
+        uint32_t read = KPADReadEx((KPADChan)channel, &fresh_status, 1, &kerror);
+        if (read > 0 && kerror == KPAD_ERROR_OK) {
+            kpad[channel] = fresh_status;
+            kpad_valid[channel] = 1;
+        } else if (kerror == KPAD_ERROR_INVALID_CONTROLLER || kerror == KPAD_ERROR_UNINITIALIZED) {
+            kpad_valid[channel] = 0;
+        }
+        /* no new sample: the last one still holds */
+        if (!kpad_valid[channel]) continue;
+        const KPADStatus status = kpad[channel];
         if (status.extensionType == WPAD_EXT_PRO_CONTROLLER) {
             input->buttons |= map_buttons(status.pro.hold, pro_map, sizeof pro_map / sizeof *pro_map);
             add_stick(&input->circle_x, &input->circle_y, status.pro.leftStick.x, status.pro.leftStick.y);
@@ -242,16 +263,25 @@ static int open_display(Display *display, const char *name, uint32_t only, int w
         display->width = width;
         display->height = height;
     }
-    /* RGBA32 is bytes R, G, B, A in memory whatever the byte order, which is
-       how the runtime hands the screens over */
-    display->top = SDL_CreateTexture(display->renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, ZW_TOP_WIDTH, ZW_SCREEN_HEIGHT);
-    display->bottom = SDL_CreateTexture(display->renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, ZW_BOTTOM_WIDTH, ZW_SCREEN_HEIGHT);
+    /* RGBX8888 is a 32-bit word 0xRRGGBBXX, on this big-endian CPU bytes
+       R, G, B, X in memory, how the runtime hands the screens over. The X
+       matters: the console's framebuffers carry whatever alpha the game
+       left, which its LCD ignores, while SDL would blend by it and its Wii U
+       renderer alpha-tests every texture, so a game that leaves alpha at 0
+       would show black. RGBX reads alpha as 1 and draws without blending. */
+    display->top = SDL_CreateTexture(display->renderer, SDL_PIXELFORMAT_RGBX8888, SDL_TEXTUREACCESS_STREAMING, ZW_TOP_WIDTH, ZW_SCREEN_HEIGHT);
+    display->bottom = SDL_CreateTexture(display->renderer, SDL_PIXELFORMAT_RGBX8888, SDL_TEXTUREACCESS_STREAMING, ZW_BOTTOM_WIDTH, ZW_SCREEN_HEIGHT);
     if (!display->top || !display->bottom) {
         WHBLogPrintf("could not make the %s's textures: %s", name, SDL_GetError());
         return -1;
     }
     SDL_SetTextureScaleMode(display->top, SDL_ScaleModeLinear);
     SDL_SetTextureScaleMode(display->bottom, SDL_ScaleModeLinear);
+    SDL_SetTextureBlendMode(display->top, SDL_BLENDMODE_NONE);
+    SDL_SetTextureBlendMode(display->bottom, SDL_BLENDMODE_NONE);
+    /* texture memory starts as whatever was there: black until a frame */
+    SDL_UpdateTexture(display->top, NULL, top_pixels, ZW_TOP_WIDTH * 4);
+    SDL_UpdateTexture(display->bottom, NULL, bottom_pixels, ZW_BOTTOM_WIDTH * 4);
     WHBLogPrintf("%s is %dx%d", name, display->width, display->height);
     return 0;
 }
@@ -341,12 +371,23 @@ static void pump_audio(void) {
         uint32_t frames = zakuro_wiiu_take_audio(samples, 4096);
         if (frames == 0) break;
         /* the output fell behind: what doesn't fit goes */
-        if (SDL_GetQueuedAudioSize(audio) < most) SDL_QueueAudio(audio, samples, frames * 4);
+        if (SDL_GetQueuedAudioSize(audio) + frames * 4 <= most) SDL_QueueAudio(audio, samples, frames * 4);
     }
     if (!audio_started && SDL_GetQueuedAudioSize(audio) >= audio_rate / 20 * 4) {
         SDL_PauseAudioDevice(audio, 0);
         audio_started = 1;
     }
+}
+
+/* back from the HOME menu: what was queued and held is stale, and the
+   output starts again once it has a cushion */
+static void reset_audio(void) {
+    static int16_t samples[4096 * 2];
+    if (!audio) return;
+    SDL_PauseAudioDevice(audio, 1);
+    SDL_ClearQueuedAudio(audio);
+    while (zakuro_wiiu_take_audio(samples, 4096) > 0) {}
+    audio_started = 0;
 }
 
 /* ---- the game ---- */
@@ -384,10 +425,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+    /* the TV window at the TV's resolution, 1080p sharp where it can be */
+    SDL_DisplayMode tv_mode;
+    SDL_zero(tv_mode);
+    if (SDL_GetDesktopDisplayMode(0, &tv_mode) != 0) SDL_zero(tv_mode);
     /* the GamePad's window presents first and leaves the swap to the TV's,
        which swaps both */
     if (open_display(&drc, "GamePad", SDL_WINDOW_WIIU_GAMEPAD_ONLY | SDL_WINDOW_WIIU_PREVENT_SWAP, DRC_WIDTH, DRC_HEIGHT) != 0 ||
-        open_display(&tv, "TV", SDL_WINDOW_WIIU_TV_ONLY, 1280, 720) != 0) {
+        open_display(&tv, "TV", SDL_WINDOW_WIIU_TV_ONLY, tv_mode.w > 0 ? tv_mode.w : 1280, tv_mode.h > 0 ? tv_mode.h : 720) != 0) {
         close_display(&tv);
         close_display(&drc);
         SDL_Quit();
@@ -424,12 +469,41 @@ int main(int argc, char **argv) {
 
     ZwLayoutPlan plan;
     int running = 1;
+    int background = 0;
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) running = 0;
+            switch (event.type) {
+            case SDL_QUIT:
+                running = 0;
+                break;
+            case SDL_APP_WILLENTERBACKGROUND:
+            case SDL_APP_DIDENTERBACKGROUND:
+                background = 1;
+                break;
+            case SDL_APP_WILLENTERFOREGROUND:
+            case SDL_APP_DIDENTERFOREGROUND:
+                background = 0;
+                break;
+            case SDL_WINDOWEVENT:
+                if (event.window.event == SDL_WINDOWEVENT_HIDDEN) background = 1;
+                if (event.window.event == SDL_WINDOWEVENT_SHOWN) background = 0;
+                break;
+            }
         }
         if (!running) break;
+        /* the HOME menu has the console: the game waits, nothing is read or
+           drawn, and the heartbeat stops as a second guard */
+        static int was_background;
+        if (background != was_background) {
+            was_background = background;
+            zakuro_wiiu_pause(background);
+            if (!background) reset_audio();
+        }
+        if (background) {
+            SDL_Delay(10);
+            continue;
+        }
         zakuro_wiiu_heartbeat();
 
         zw_layout_plan(layout, tv.width, tv.height, drc.width, drc.height, &plan);
@@ -455,11 +529,12 @@ int main(int argc, char **argv) {
         }
 
         if (zakuro_wiiu_take_frame(top_pixels, bottom_pixels)) {
-            /* both displays keep their own copy; only those shown are fed */
-            if (plan.tv_top.w) SDL_UpdateTexture(tv.top, NULL, top_pixels, ZW_TOP_WIDTH * 4);
-            if (plan.tv_bottom.w) SDL_UpdateTexture(tv.bottom, NULL, bottom_pixels, ZW_BOTTOM_WIDTH * 4);
-            if (plan.drc_top.w) SDL_UpdateTexture(drc.top, NULL, top_pixels, ZW_TOP_WIDTH * 4);
-            if (plan.drc_bottom.w) SDL_UpdateTexture(drc.bottom, NULL, bottom_pixels, ZW_BOTTOM_WIDTH * 4);
+            /* each display keeps its own copy, all kept current so a layout
+               switched to shows the game as it is */
+            SDL_UpdateTexture(tv.top, NULL, top_pixels, ZW_TOP_WIDTH * 4);
+            SDL_UpdateTexture(tv.bottom, NULL, bottom_pixels, ZW_BOTTOM_WIDTH * 4);
+            SDL_UpdateTexture(drc.top, NULL, top_pixels, ZW_TOP_WIDTH * 4);
+            SDL_UpdateTexture(drc.bottom, NULL, bottom_pixels, ZW_BOTTOM_WIDTH * 4);
         }
         pump_audio();
 

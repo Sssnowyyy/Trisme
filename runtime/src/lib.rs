@@ -120,6 +120,8 @@ struct Shared {
     message: Mutex<String>,
     state: AtomicI32,
     stop: AtomicBool,
+    /// the platform holds the console still, in the HOME menu.
+    paused: AtomicBool,
     /// frames the console ran, for the log.
     frames: AtomicU32,
 }
@@ -134,6 +136,7 @@ fn shared() -> &'static Shared {
         message: Mutex::new(String::new()),
         state: AtomicI32::new(STATE_LOADING),
         stop: AtomicBool::new(false),
+        paused: AtomicBool::new(false),
         frames: AtomicU32::new(0),
     })
 }
@@ -309,6 +312,9 @@ fn console(start: Start) {
             log::warn!("the recompiled code is older than this runtime expects; parts may run in the interpreter");
         }
     }
+    if shared.stop.load(Ordering::SeqCst) {
+        return;
+    }
     shared.state.store(STATE_RUNNING, Ordering::SeqCst);
     log::info!("running");
 
@@ -319,7 +325,7 @@ fn console(start: Start) {
     while !shared.stop.load(Ordering::Relaxed) {
         // the main thread stopped coming by: the HOME menu has the console,
         // so this one waits, and starts its schedule over after
-        let quiet = shared.heartbeat.lock().unwrap().elapsed() > HEARTBEAT_TIMEOUT;
+        let quiet = shared.paused.load(Ordering::Relaxed) || shared.heartbeat.lock().unwrap().elapsed() > HEARTBEAT_TIMEOUT;
         if quiet {
             std::thread::sleep(Duration::from_millis(10));
             next_frame = Instant::now();
@@ -497,14 +503,31 @@ pub extern "C" fn zakuro_wiiu_heartbeat() {
     *shared().heartbeat.lock().unwrap() = Instant::now();
 }
 
+/// holds the console still, or lets it go on.
+#[no_mangle]
+pub extern "C" fn zakuro_wiiu_pause(paused: i32) {
+    shared().paused.store(paused != 0, Ordering::SeqCst);
+    if paused == 0 {
+        zakuro_wiiu_heartbeat();
+    }
+}
+
 /// stops the console and waits for its thread, which writes out what it
-/// still has to.
+/// still has to. a game still loading has nothing to write and isn't waited
+/// for, so closing from the HOME menu never hangs on a long read.
 #[no_mangle]
 pub extern "C" fn zakuro_wiiu_stop() {
-    shared().stop.store(true, Ordering::SeqCst);
-    // the console waits out a quiet main thread; it must see the stop
+    let shared = shared();
+    shared.stop.store(true, Ordering::SeqCst);
+    // the console waits out a pause or a quiet main thread; it must see the stop
+    shared.paused.store(false, Ordering::SeqCst);
     zakuro_wiiu_heartbeat();
     if let Some(handle) = THREAD.lock().unwrap().take() {
-        let _ = handle.join();
+        if shared.state.load(Ordering::SeqCst) == STATE_LOADING {
+            log::info!("closing while the game loads, not waiting for it");
+            drop(handle);
+        } else {
+            let _ = handle.join();
+        }
     }
 }
