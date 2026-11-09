@@ -249,7 +249,7 @@ fn cia_executable(header: &[u8], mut read: impl FnMut(u64, usize) -> Result<Vec<
         }
         if index == 0 {
             if be16(record + 6) & 1 != 0 {
-                return error("the .cia is encrypted, it has to be decrypted first");
+                return error("the .cia is encrypted, it has to be decrypted first, which 3dsrecomp decrypt does with your console's keys");
             }
             return Ok(offset);
         }
@@ -299,7 +299,7 @@ impl Title {
         // encrypted when its ExeFS turns out unreadable, below
         let no_crypto = flags[7] & 0x04 != 0;
         if !no_crypto && flags[3] != 0 {
-            return error("the dump is encrypted, it has to be decrypted first");
+            return error("the dump is encrypted, it has to be decrypted first, which 3dsrecomp decrypt does with your console's keys");
         }
         let program_id = u64_at(&header, 0x118);
         let exefs = ncch + u32_at(&header, 0x1A0) as u64 * MEDIA_UNIT;
@@ -321,7 +321,7 @@ impl Title {
                 Error(if no_crypto {
                     "the ExeFS has no .code".into()
                 } else {
-                    "the dump is encrypted, it has to be decrypted first (the ExeFS has no .code)".into()
+                    "the dump is encrypted, it has to be decrypted first, which 3dsrecomp decrypt does with your console's keys (the ExeFS has no .code)".into()
                 })
             })?;
 

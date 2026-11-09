@@ -22,6 +22,10 @@ verify = ["host", "dep:zakuro-cpu"]
 [dependencies]
 recomp-abi = { path = "abi", default-features = false }
 zakuro-cpu = { git = "https://github.com/fearkov/zakuro", optional = true }
+# decrypting retail dumps with the user's own keys, see src/crypto.rs
+aes = "0.8"
+ctr = "0.9"
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

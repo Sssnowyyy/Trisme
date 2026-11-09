@@ -12,6 +12,7 @@ use std::process::exit;
 
 use recomp3ds::build::{self, Event};
 use recomp3ds::discover::{self, Analysis, Byte, Mode, Program, Source};
+use recomp3ds::crypto::{self, KeyOptions};
 use recomp3ds::rom::Title;
 use recomp3ds::{compile, port, Mods};
 #[cfg(feature = "verify")]
@@ -21,12 +22,20 @@ const USAGE: &str = "\
 usage, 3dsrecomp analyze <rom>
        3dsrecomp build <rom> [<dir>] [--overrides <file or dir>]
        3dsrecomp port <rom> <dir> [--overrides <file or dir>] [--name <name>] [--zakuro <checkout>]
+       3dsrecomp wiiu-code <rom> <dir> [--overrides <file or dir>]
        3dsrecomp verify <rom> <library> [count]
        3dsrecomp hints <rom> [<hints file>]
+       3dsrecomp decrypt <rom> <out.cxi> [--keys <file>] [--seeddb <file>]
 
 build without a dir works in the cache and installs the library where
 Zakuro finds it on its own. hints prints the game's section for hints.txt,
-from the hints Zakuro wrote next to its library or the file given.";
+from the hints Zakuro wrote next to its library or the file given.
+
+decrypt writes the executable of an encrypted .3ds, .cia or .cxi as a
+decrypted .cxi, with the AES keys of your own console from an aes_keys.txt,
+given with --keys <file> or found next to the ROM or in Azahar's or Citra's
+sysdata folder, and with --seeddb <file> for titles with seeds. the other
+commands decrypt an encrypted ROM into the cache the same way first.";
 
 /// what the options on the command line ask for.
 #[derive(Default)]
@@ -37,6 +46,8 @@ struct Options {
     name: Option<String>,
     /// a Zakuro checkout for port to build against.
     zakuro: Option<PathBuf>,
+    /// the key file and seed database for decrypting.
+    keys: KeyOptions,
 }
 
 fn main() {
@@ -54,6 +65,8 @@ fn main() {
             "--overrides" => options.overrides = Some(value().into()),
             "--name" => options.name = Some(value()),
             "--zakuro" => options.zakuro = Some(value().into()),
+            "--keys" => options.keys.keys = Some(value().into()),
+            "--seeddb" => options.keys.seeddb = Some(value().into()),
             other if other.starts_with("--") => {
                 eprintln!("unknown option {other}\n{USAGE}");
                 exit(2);
@@ -61,11 +74,19 @@ fn main() {
             _ => words.push(arg),
         }
     }
+    // an encrypted dump is read through a decrypted copy in the cache
+    if let [command, rom, ..] = &mut words[..] {
+        if ["analyze", "build", "port", "wiiu-code", "hints", "verify"].contains(&command.as_str()) {
+            *rom = readable(rom, &options.keys);
+        }
+    }
     match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["analyze", rom] => analyze(rom),
+        ["decrypt", rom, out] => decrypt(rom, Path::new(out), &options.keys),
         ["build", rom] => build(rom, None, &options),
         ["build", rom, dir] => build(rom, Some(Path::new(dir)), &options),
         ["port", rom, dir] => port(rom, Path::new(dir), &options),
+        ["wiiu-code", rom, dir] => wiiu_code(rom, Path::new(dir), &options),
         ["hints", rom] => hints(rom, None),
         ["hints", rom, file] => hints(rom, Some(Path::new(file))),
         #[cfg(feature = "verify")]
@@ -80,6 +101,40 @@ fn main() {
         _ => {
             eprintln!("{USAGE}");
             exit(2);
+        }
+    }
+}
+
+/// the dump at path, or when it is encrypted a decrypted copy of it in the
+/// cache, made with the user's keys the first time.
+fn readable(path: &str, keys: &KeyOptions) -> String {
+    match crypto::readable(Path::new(path), keys, &|note| eprintln!("{note}")) {
+        Ok(readable) => readable.to_string_lossy().into_owned(),
+        Err(error) => {
+            eprintln!("{error}");
+            exit(1);
+        }
+    }
+}
+
+/// writes the executable of the dump at path to out, decrypted.
+fn decrypt(path: &str, out: &Path, keys: &KeyOptions) {
+    let start = std::time::Instant::now();
+    let tenth = std::cell::Cell::new(0);
+    let progress = |done: u64, total: u64| {
+        if done * 10 / total.max(1) != tenth.get() {
+            tenth.set(done * 10 / total.max(1));
+            println!("{} of {} MiB", done >> 20, total >> 20);
+        }
+    };
+    match crypto::decrypt_to_cxi_with_progress(Path::new(path), out, keys, &progress) {
+        Ok(info) => {
+            let what = if info.already_decrypted { "was not encrypted, took it out" } else { "decrypted" };
+            println!("{:016X} {}, {what} to {} in {:.1?}", info.title_id, info.product_code, out.display(), start.elapsed());
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            exit(1);
         }
     }
 }
@@ -187,6 +242,32 @@ fn port(path: &str, dir: &Path, options: &Options) {
     }
     println!("wrote the project for {name}, build it with cargo build --release in {}", dir.display());
     println!("then run target/release/{name} with the path to the game");
+}
+
+/// the title's code compiled for the Wii U into dir/code/librecomp.a, with
+/// dir/code/info.json, see docs/wiiu.md.
+fn wiiu_code(path: &str, dir: &Path, options: &Options) {
+    let written = recomp3ds::wiiu::write_wiiu_code_with(Path::new(path), dir, options.overrides.as_deref(), Mods::default(), &print_event);
+    match written {
+        Ok(info) => {
+            println!(
+                "{} for {} ({:016X}), {} entries, {} modules, {} KiB, recomp_abi {} recomp_generation {}",
+                info.library.display(),
+                info.title,
+                info.program_id,
+                info.entry_count,
+                info.module_count,
+                info.library_bytes >> 10,
+                info.abi,
+                info.generation
+            );
+            println!("wrote {}", info.info.display());
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            exit(1);
+        }
+    }
 }
 
 /// runs up to count of the recompiled functions of each program against

@@ -24,6 +24,7 @@ pub mod build;
 pub mod codegen;
 pub mod compile;
 pub mod cro;
+pub mod crypto;
 pub mod discover;
 pub mod image;
 pub mod natives;
@@ -33,6 +34,7 @@ pub mod rom;
 mod thumb;
 #[cfg(feature = "verify")]
 pub mod verify;
+pub mod wiiu;
 
 use discover::Program;
 use rom::{DirEntry, Error, FileEntry, RomFs, Title};
