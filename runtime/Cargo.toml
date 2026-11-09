@@ -1,0 +1,32 @@
+[package]
+name = "zakuro-wiiu-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Zakuro as a Wii U runtime: the emulator core a recompiled 3DS title links against, driven by the C platform layer in ../platform"
+publish = false
+
+[lib]
+name = "zakuro_wiiu"
+crate-type = ["staticlib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+zakuro-core = { path = "../zakuro/crates/zakuro-core", default-features = false }
+zakuro-common = { path = "../zakuro/crates/zakuro-common" }
+zakuro-fs = { path = "../zakuro/crates/zakuro-fs" }
+log = "0.4"
+
+# a project of its own, outside zakuro's workspace
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+debug = 0
+
+[profile.dev]
+panic = "abort"
+opt-level = 2

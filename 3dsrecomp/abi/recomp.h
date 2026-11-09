@@ -155,6 +155,25 @@ typedef struct Origins {
 #define READ_PAGES(c) ((c)->read_pages)
 #define WRITE_PAGES(c) ((c)->write_pages)
 
+/* guest memory is little-endian bytes whatever the host is. a host that is
+   big-endian, the Wii U's PowerPC say, swaps every halfword and word it
+   moves between a page and an integer, which gcc turns into lhbrx, lwbrx,
+   sthbrx and stwbrx, a single instruction each. on a little-endian host
+   these are nothing at all. the host's callbacks take and give integers,
+   which need no swapping, and a double is two words, the low one first. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define RECOMP_BIG_ENDIAN 1
+#define GUEST16(value) __builtin_bswap16(value)
+#define GUEST32(value) __builtin_bswap32(value)
+#define GUEST_STORE16(at, value) do { uint16_t guest_ = __builtin_bswap16(value); memcpy((at), &guest_, 2); } while (0)
+#define GUEST_STORE32(at, value) do { uint32_t guest_ = __builtin_bswap32(value); memcpy((at), &guest_, 4); } while (0)
+#else
+#define GUEST16(value) (value)
+#define GUEST32(value) (value)
+#define GUEST_STORE16(at, value) memcpy((at), &(value), 2)
+#define GUEST_STORE32(at, value) memcpy((at), &(value), 4)
+#endif
+
 static ALWAYS_INLINE uint8_t mem_read8_in(Context *ctx, uint8_t *const *pages, uint32_t address) {
     uint8_t *page = pages[address >> 12];
     if (LIKELY(page)) return page[address & 0xFFF];
@@ -167,7 +186,7 @@ static ALWAYS_INLINE uint16_t mem_read16_in(Context *ctx, uint8_t *const *pages,
     if (LIKELY(page && offset <= 0xFFE)) {
         uint16_t value;
         memcpy(&value, page + offset, 2);
-        return value;
+        return GUEST16(value);
     }
     return ctx->host->read16(ctx, address);
 }
@@ -178,7 +197,7 @@ static ALWAYS_INLINE uint32_t mem_read32_in(Context *ctx, uint8_t *const *pages,
     if (LIKELY(page && offset <= 0xFFC)) {
         uint32_t value;
         memcpy(&value, page + offset, 4);
-        return value;
+        return GUEST32(value);
     }
     return ctx->host->read32(ctx, address);
 }
@@ -192,14 +211,14 @@ static ALWAYS_INLINE void mem_write8_in(Context *ctx, uint8_t *const *pages, uin
 static ALWAYS_INLINE void mem_write16_in(Context *ctx, uint8_t *const *pages, uint32_t address, uint16_t value) {
     uint8_t *page = pages[address >> 12];
     uint32_t offset = address & 0xFFF;
-    if (LIKELY(page && offset <= 0xFFE)) memcpy(page + offset, &value, 2);
+    if (LIKELY(page && offset <= 0xFFE)) GUEST_STORE16(page + offset, value);
     else ctx->host->write16(ctx, address, value);
 }
 
 static ALWAYS_INLINE void mem_write32_in(Context *ctx, uint8_t *const *pages, uint32_t address, uint32_t value) {
     uint8_t *page = pages[address >> 12];
     uint32_t offset = address & 0xFFF;
-    if (LIKELY(page && offset <= 0xFFC)) memcpy(page + offset, &value, 4);
+    if (LIKELY(page && offset <= 0xFFC)) GUEST_STORE32(page + offset, value);
     else ctx->host->write32(ctx, address, value);
 }
 
@@ -224,14 +243,16 @@ static ALWAYS_INLINE uint8_t *mem_span_in(uint8_t *const *pages, uint32_t addres
 #define mem_read_span(c, address, bytes) ((const uint8_t *)mem_span_in(READ_PAGES(c), (address), (bytes)))
 #define mem_write_span(c, address, bytes) mem_span_in(WRITE_PAGES(c), (address), (bytes))
 
+/* a guest word in a span, which ldm, stm, vldm and vstm go through, a
+   double as its two words, the low one at the lower address. */
 static ALWAYS_INLINE uint32_t load32(const uint8_t *at) {
     uint32_t value;
     memcpy(&value, at, 4);
-    return value;
+    return GUEST32(value);
 }
 
 static ALWAYS_INLINE void store32(uint8_t *at, uint32_t value) {
-    memcpy(at, &value, 4);
+    GUEST_STORE32(at, value);
 }
 
 #define C_EQ (ctx->z)

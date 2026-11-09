@@ -1,0 +1,20 @@
+[package]
+name = "cia2wiiu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Turns a 3DS game (.cia/.3ds/.cxi) into a Wii U title: recompiled by 3dsrecomp, run by Zakuro, packed as a .wuhb or an installable WUP folder"
+publish = false
+
+[[bin]]
+name = "cia2wiiu"
+path = "src/main.rs"
+
+[dependencies]
+recomp3ds = { path = "../3dsrecomp" }
+
+# a project of its own
+[workspace]
+
+[profile.release]
+debug = 0

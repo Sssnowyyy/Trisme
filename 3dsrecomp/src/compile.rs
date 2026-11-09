@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// floating point has to round exactly the way the interpreter does, so
 /// nothing may be fused into a multiply-add.
-const FLAGS: &[&str] = &["-O2", "-ffp-contract=off", "-fno-math-errno", "-w"];
+pub const FLAGS: &[&str] = &["-O2", "-ffp-contract=off", "-fno-math-errno", "-w"];
 /// what only matters for ELF and Mach-O, and that compilers for Windows
 /// refuse or ignore.
 const UNIX_FLAGS: &[&str] = &["-fPIC", "-fvisibility=hidden"];
@@ -195,6 +195,21 @@ pub fn objects(
     progress: Progress,
     background: bool,
 ) -> Result<Vec<PathBuf>, String> {
+    let flags: Vec<&str> = FLAGS.iter().chain(if cfg!(windows) { &[][..] } else { UNIX_FLAGS }).copied().collect();
+    objects_with(compiler, dir, sources, &flags, progress, background)
+}
+
+/// the same with flags of its own in place of the host's, for a compiler
+/// that builds for another machine, the Wii U's say, see wiiu.rs. gcc's
+/// options for its garbage go in either way.
+pub fn objects_with(
+    compiler: &Compiler,
+    dir: &Path,
+    sources: &[String],
+    flags: &[&str],
+    progress: Progress,
+    background: bool,
+) -> Result<Vec<PathBuf>, String> {
     let gcc = compiler.is_gcc();
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = if background { cores.saturating_sub(1).max(1) } else { cores };
@@ -238,9 +253,8 @@ pub fn objects(
                     lower(&mut command);
                 }
                 let status = command
-                    .args(FLAGS)
+                    .args(flags)
                     .args(if gcc { GCC_FLAGS } else { &[] })
-                    .args(if cfg!(windows) { &[][..] } else { UNIX_FLAGS })
                     .arg("-I")
                     .arg(dir)
                     .arg("-c")

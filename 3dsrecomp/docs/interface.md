@@ -232,7 +232,11 @@ receives the address it needs as an argument.
 page of the 32-bit address space.
 
 - A non-null entry points to the page's bytes, in guest (little-endian)
-  order. The code reads or writes that page directly.
+  order. The code reads or writes that page directly. This holds on a
+  big-endian host too, such as the Wii U: `recomp.h` byte-swaps every
+  halfword and word it moves between a page and a host integer there, and a
+  double is two such words, the low one at the lower address. Values passed
+  to and returned from the callbacks are plain host integers.
 - A null entry sends every access to that page through the host's
   `read8`/`read16`/`read32` or `write8`/`write16`/`write32` callbacks.
 
