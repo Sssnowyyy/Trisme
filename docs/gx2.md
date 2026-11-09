@@ -27,7 +27,7 @@ Fragment work is what costs most on the CPU, so this is where the GPU helps. The
 
 ## Building with it
 
-Download CafeGLSL's release for your computer (`cafeglsl-*-linux-x86_64`, `-macos-arm64`, `-macos-x86_64` or `-windows-x86_64`; not the `wiiu-ppc` one) and point the kit build at it:
+Download CafeGLSL v1.0.0-rc1 or newer for your computer (`cafeglsl-*-linux-x86_64`, `-macos-arm64`, `-macos-x86_64` or `-windows-x86_64`; not the `wiiu-ppc` one). It's a pre-release, so the releases page's "Latest" label points at v0.2.0 instead, which has only a Linux compiler. Unpack it (on macOS, `xattr -dr com.apple.quarantine <folder>` if it won't run) and point the kit build at it:
 
 ```
 CAFEGLSL_DIR=/path/to/cafeglsl-1.0.0-rc1-macos-arm64 tools/build-kit.sh

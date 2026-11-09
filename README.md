@@ -93,7 +93,7 @@ tools/build-kit.sh                     # the runtime and platform layer for the 
 cd converter && cargo build --release  # the converter, for your computer
 ```
 
-For the GPU renderer, the kit also needs [CafeGLSL](https://github.com/Exzap/CafeGLSL/releases)'s offline shader compiler: download the release for your computer (not the `wiiu-ppc` one) and pass its folder, `CAFEGLSL_DIR=/path/to/cafeglsl-... tools/build-kit.sh`. Without it the kit still builds, and games draw their 3D on the CPU. See [docs/gx2.md](docs/gx2.md).
+For the GPU renderer, the kit also needs [CafeGLSL](https://github.com/Exzap/CafeGLSL/releases)'s offline shader compiler: take v1.0.0-rc1 or newer and the archive for your computer, e.g. `cafeglsl-1.0.0-rc1-macos-arm64.tar.xz` (not the `wiiu-ppc` one; v1.0.0-rc1 is a pre-release, so GitHub's "Latest" label points at v0.2.0, which has no macOS or Windows compiler) and pass its folder, `CAFEGLSL_DIR=/path/to/cafeglsl-... tools/build-kit.sh`. Without it the kit still builds, and games draw their 3D on the CPU. See [docs/gx2.md](docs/gx2.md).
 
 `tools/build-kit.sh` looks for devkitPro in `DEVKITPRO` (default `/opt/devkitpro`). `ZAKURO_WIIU_RUST` picks a toolchain other than `nightly`, `KIT_DIR` sets another output folder and `CARGO_TARGET_DIR` sets another build folder.
 

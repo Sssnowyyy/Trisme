@@ -6,8 +6,8 @@
 #
 # the compiler is looked for in $CAFEGLSL (the glslcompiler binary itself),
 # $CAFEGLSL_DIR/bin, PATH and $DEVKITPRO/tools/bin. get it from
-# https://github.com/Exzap/CafeGLSL/releases (the build for your computer,
-# not the wiiu-ppc one). without it the object holds no shaders, which is
+# https://github.com/Exzap/CafeGLSL/releases, v1.0.0-rc1 or newer (a
+# pre-release), the build for your computer, not the wiiu-ppc one. without it the object holds no shaders, which is
 # fine: games then draw their 3D on the CPU. ZW_REQUIRE_GX2=1 makes a missing
 # compiler or a failed compile an error instead.
 #
