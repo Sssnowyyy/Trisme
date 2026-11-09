@@ -1,0 +1,34 @@
+{
+  "arch": "powerpc",
+  "cpu": "750",
+  "crt-objects-fallback": "false",
+  "data-layout": "E-m:e-p:32:32-Fn32-i64:64-n32",
+  "env": "newlib",
+  "exe-suffix": ".elf",
+  "features": "+hard-float,-altivec",
+  "has-thread-local": false,
+  "linker": "powerpc-eabi-gcc",
+  "linker-flavor": "gnu-cc",
+  "llvm-target": "powerpc-unknown-eabi",
+  "max-atomic-width": 32,
+  "metadata": {
+    "description": "Nintendo Wii U (Espresso, devkitPPC + wut newlib), std through the newlib/horizon path",
+    "host_tools": false,
+    "std": true,
+    "tier": 3
+  },
+  "no-default-libraries": false,
+  "os": "horizon",
+  "vendor": "wiiu",
+  "panic-strategy": "abort",
+  "pre-link-args": {
+    "gnu-cc": ["-mcpu=750", "-meabi", "-mhard-float"]
+  },
+  "relocation-model": "static",
+  "target-endian": "big",
+  "target-c-int-width": 32,
+  "target-family": ["unix"],
+  "target-pointer-width": 32,
+  "default-uwtable": false,
+  "emit-debug-gdb-scripts": false
+}
