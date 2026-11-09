@@ -1,7 +1,7 @@
 //! the unpacked layout of an installable Wii U title, code/ content/ meta/,
-//! the way NUSPacker takes it to make the WUP that WUP Installer GX2 or
-//! WUPInstaller installs to the Home Menu. Packing and installing need the
-//! console's common key and a homebrew environment, which are the user's.
+//! the way nus.rs (or NUSPacker) takes it to make the WUP that WUP Installer
+//! GX2 or WUPInstaller installs to the Home Menu. Packing and installing need
+//! the console's common key and a homebrew environment, which are the user's.
 
 use std::fmt::Write as _;
 use std::path::Path;

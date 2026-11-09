@@ -12,6 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 recomp3ds = { path = "../3dsrecomp" }
+# the WUP packer (nus.rs): AES-128-CBC, SHA-1 for contents and hashes,
+# SHA-256 for the TMD, and a random title key
+aes = "0.8"
+sha1 = "0.11"
+sha2 = "0.10"
+getrandom = "0.2"
 
 # a project of its own
 [workspace]

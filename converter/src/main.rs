@@ -7,11 +7,12 @@
 //! 3. links that with the Zakuro runtime and the Wii U platform layer (the
 //!    kit) into an RPX;
 //! 4. packs the RPX, the game and its icon as a .wuhb (Aroma), or as the
-//!    unpacked code/content/meta layout NUSPacker turns into an installable
-//!    WUP.
+//!    unpacked code/content/meta layout of an installed title, which --pack
+//!    packs into an installable WUP (as NUSPacker would).
 
 mod cxi;
 mod images;
+mod nus;
 mod recomp;
 mod toolchain;
 mod wup;
@@ -23,12 +24,31 @@ use toolchain::{run, Kit, Toolchain};
 
 const USAGE: &str = "\
 usage: cia2wiiu <game.cia|.3ds|.cxi> [options]
+       cia2wiiu pack <title folder> -o <wup folder> --common-key <file>
+                     [--title-key <hex>] [--cert <title.cert>]
+                          packs a title --format wup already wrote (its
+                          code/ content/ meta/) into an installable WUP,
+                          without converting again
 
 options:
   -o, --output <path>     the .wuhb to write, or the folder for --format wup
                           (default: next to the game, named after it)
   --format <wuhb|wup>     wuhb: one file for Aroma's Homebrew on Menu (default)
-                          wup: code/ content/ meta/ for NUSPacker, to install
+                          wup: the unpacked title, code/ content/ meta/, to
+                          install once packed (--pack, or NUSPacker)
+  --pack                  with --format wup: write an installable WUP
+                          (title.tmd, title.tik, title.cert, *.app, *.h3) for
+                          WUP Installer GX2 on a console with signature
+                          patches (Aroma, Mocha); the unpacked title goes in
+                          the work folder (kept with --keep)
+  --common-key <file>     for --pack: the Wii U common key, from your own
+                          console, as 16 raw bytes or 32 hex digits (or set
+                          WIIU_COMMON_KEY_FILE to the file)
+  --title-key <hex>       for --pack: the title key, 32 hex digits (default: a
+                          random one for each pack)
+  --cert <title.cert>     for --pack: a title.cert to copy, e.g. from a title
+                          you dumped from your console (default: a stand-in
+                          chain with the right layout and no real signatures)
   --layout <split|tv|gamepad>
                           the screens on first start (R3 cycles them in game):
                           split   top screen on the TV, bottom on the GamePad
@@ -59,6 +79,10 @@ struct Options {
     rom: PathBuf,
     output: Option<PathBuf>,
     wup: bool,
+    pack: bool,
+    common_key: Option<PathBuf>,
+    title_key: Option<String>,
+    cert: Option<PathBuf>,
     layout: i32,
     renderer: u8,
     keys: Option<PathBuf>,
@@ -81,6 +105,10 @@ fn parse() -> Result<Options, String> {
         rom: PathBuf::new(),
         output: None,
         wup: false,
+        pack: false,
+        common_key: None,
+        title_key: None,
+        cert: None,
         layout: 0,
         renderer: 1,
         keys: None,
@@ -112,6 +140,10 @@ fn parse() -> Result<Options, String> {
                     other => return Err(format!("unknown format {other}, wuhb or wup")),
                 }
             }
+            "--pack" => options.pack = true,
+            "--common-key" => options.common_key = Some(value(&arg)?.into()),
+            "--title-key" => options.title_key = Some(value(&arg)?),
+            "--cert" => options.cert = Some(value(&arg)?.into()),
             "--layout" => {
                 options.layout = match value(&arg)?.as_str() {
                     "split" | "0" => 0,
@@ -151,6 +183,19 @@ fn parse() -> Result<Options, String> {
         }
     }
     options.rom = rom.ok_or_else(|| USAGE.to_owned())?;
+    if options.pack {
+        if !options.wup {
+            return Err("--pack packs an installable title, so it goes with --format wup".into());
+        }
+        if options.common_key.is_none() {
+            options.common_key = std::env::var_os("WIIU_COMMON_KEY_FILE").filter(|path| !path.is_empty()).map(PathBuf::from);
+        }
+        if options.common_key.is_none() {
+            return Err("--pack needs the Wii U common key, which you supply yourself: --common-key <file>, or WIIU_COMMON_KEY_FILE=<file>".into());
+        }
+    } else if options.common_key.is_some() || options.title_key.is_some() || options.cert.is_some() {
+        return Err("--common-key, --title-key and --cert are for --pack".into());
+    }
     Ok(options)
 }
 
@@ -187,6 +232,11 @@ fn convert(options: &Options) -> Result<(), String> {
     if !options.rom.is_file() {
         return Err(format!("{} is not a file", options.rom.display()));
     }
+    // the keys are checked now rather than after the slow steps
+    let pack_keys = match &options.common_key {
+        Some(common_key) if options.pack => Some(nus::PackKeys::load(common_key, options.title_key.as_deref(), options.cert.as_deref())?),
+        _ => None,
+    };
 
     let stem = options.rom.file_stem().map(|s| file_name(&s.to_string_lossy())).unwrap_or_else(|| "game".into());
     let output = match &options.output {
@@ -298,11 +348,18 @@ fn convert(options: &Options) -> Result<(), String> {
     // 4. the package
     let icon = smdh.as_ref().map(|s| &s.icon);
     if options.wup {
-        step("writing the installable title layout (for NUSPacker)");
+        // packed, the WUP goes to the output and the title it is packed from
+        // to the work folder
+        let layout = if pack_keys.is_some() { work.join("title") } else { output.clone() };
+        if pack_keys.is_some() {
+            // everything in it is packed, so nothing of an earlier run may stay
+            remove_dir(&layout).map_err(|e| format!("could not clear {}, {e}", layout.display()))?;
+        }
+        step("writing the installable title layout");
         let title_id = wup::title_id_for(cxi.program_id);
         let rpx_name = rpx.file_name().unwrap().to_string_lossy().into_owned();
         wup::write_layout(
-            &output,
+            &layout,
             &wup::WupInfo {
                 title_id,
                 rpx_name: &rpx_name,
@@ -314,12 +371,30 @@ fn convert(options: &Options) -> Result<(), String> {
             },
             icon,
         )?;
-        move_file(&rpx, &output.join("code").join(&rpx_name))?;
+        move_file(&rpx, &layout.join("code").join(&rpx_name))?;
         if cxi_path.exists() {
-            move_file(&cxi_path, &output.join("content/game.cxi"))?;
+            move_file(&cxi_path, &layout.join("content").join("game.cxi"))?;
         }
-        println!("    {} (Wii U title {:016X})", output.display(), title_id);
-        println!("    pack it: java -jar NUSPacker.jar -in {} -out <wup folder>, then install the WUP", output.display());
+        println!("    {} (Wii U title {:016X})", layout.display(), title_id);
+        match &pack_keys {
+            Some(keys) => {
+                step(&format!("packing the WUP ({})", if keys.random_title_key { "with a random title key" } else { "with the given title key" }));
+                let packed = nus::pack(&layout, &output, keys, &mut |line| println!("    {line}"))?;
+                println!(
+                    "    title.tmd, title.tik, title.cert{}",
+                    if keys.cert.is_some() { " (copied from --cert)" } else { " (a stand-in chain; see --cert if an installer rejects it)" }
+                );
+                println!(
+                    "    {} (Wii U title {:016X}, {} contents, {:.1} MiB)",
+                    output.display(),
+                    packed.title_id,
+                    packed.contents,
+                    packed.bytes as f64 / (1 << 20) as f64
+                );
+                println!("    copy the folder to sd:/install/ and install it with WUP Installer GX2 (needs signature patches: Aroma or Mocha)");
+            }
+            None => println!("    pack it: cia2wiiu pack {} -o <wup folder> --common-key <file>, then install the WUP", layout.display()),
+        }
     } else {
         step("packing the .wuhb");
         let pictures = work.join("pictures");
@@ -355,6 +430,9 @@ fn convert(options: &Options) -> Result<(), String> {
         }
     } else {
         println!("    intermediate files kept in {}", work.display());
+        if pack_keys.is_some() {
+            println!("    the unpacked title is in {}", work.join("title").display());
+        }
     }
     println!("done in {:.0?}", started.elapsed());
     Ok(())
@@ -453,7 +531,65 @@ fn text_size(toolchain: &Toolchain, elf: &Path) -> Option<u64> {
     Some(total)
 }
 
+/// cia2wiiu pack <folder> -o <out> --common-key <file> [--title-key] [--cert]
+fn pack_only(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut layout = None;
+    let mut output = None;
+    let mut common_key = std::env::var_os("WIIU_COMMON_KEY_FILE").map(PathBuf::from);
+    let mut title_key = None;
+    let mut cert = None;
+    while let Some(arg) = args.next() {
+        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
+        match arg.as_str() {
+            "-o" | "--output" => output = Some(PathBuf::from(value(&arg)?)),
+            "--common-key" => common_key = Some(PathBuf::from(value(&arg)?)),
+            "--title-key" => title_key = Some(value(&arg)?),
+            "--cert" => cert = Some(PathBuf::from(value(&arg)?)),
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => return Err(format!("unknown option {other} for pack\n\n{USAGE}")),
+            other if layout.is_none() => layout = Some(PathBuf::from(other)),
+            other => return Err(format!("pack takes one title folder, {other} is a second")),
+        }
+    }
+    let layout = layout.ok_or_else(|| format!("pack needs the title folder --format wup wrote\n\n{USAGE}"))?;
+    let output = output.ok_or("pack needs -o <folder> for the WUP")?;
+    let common_key = common_key.ok_or("pack needs --common-key <file> (or WIIU_COMMON_KEY_FILE), the Wii U common key from your own console")?;
+    if output.exists() && std::fs::read_dir(&output).map(|mut d| d.next().is_some()).unwrap_or(true) {
+        return Err(format!("{} exists and isn't empty; pick a new folder for the WUP", output.display()));
+    }
+    let keys = nus::PackKeys::load(&common_key, title_key.as_deref(), cert.as_deref())?;
+    let started = Instant::now();
+    step(&format!("packing {} ({})", layout.display(), if keys.random_title_key { "with a random title key" } else { "with the given title key" }));
+    let packed = nus::pack(&layout, &output, &keys, &mut |line| println!("    {line}"))?;
+    println!(
+        "    title.tmd, title.tik, title.cert{}",
+        if keys.cert.is_some() { " (copied from --cert)" } else { " (a stand-in chain; see --cert if an installer rejects it)" }
+    );
+    println!(
+        "    {} (Wii U title {:016X}, {} contents, {:.1} MiB)",
+        output.display(),
+        packed.title_id,
+        packed.contents,
+        packed.bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!("    install it with WUP Installer GX2 (or a similar installer) on a console with signature patches");
+    println!("done in {}s", started.elapsed().as_secs());
+    Ok(())
+}
+
 fn main() {
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some("pack") {
+        args.next();
+        if let Err(message) = pack_only(args) {
+            eprintln!("cia2wiiu: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let options = match parse() {
         Ok(options) => options,
         Err(message) => {

@@ -1,6 +1,6 @@
 # Zakuro for Wii U
 
-This turns a 3DS game you own (`.cia`, `.3ds` or `.cxi`) into a Wii U title. The output is either a `.wuhb` you start from the Wii U menu under Aroma, or an unpacked title folder that NUSPacker turns into an installable WUP.
+This turns a 3DS game you own (`.cia`, `.3ds` or `.cxi`) into a Wii U title. The output is either a `.wuhb` you start from the Wii U menu under Aroma, or a title you install to the Wii U menu: an installable WUP that the converter packs itself (`--pack`), or the unpacked title folder for NUSPacker.
 
 Two existing projects do the heavy lifting:
 
@@ -105,6 +105,8 @@ For the GPU renderer, the kit also needs [CafeGLSL](https://github.com/Exzap/Caf
 converter/target/release/cia2wiiu "My Game.cia"                        # -> My_Game.wuhb
 converter/target/release/cia2wiiu "My Game.cia" --layout gamepad
 converter/target/release/cia2wiiu "My Game.cia" --format wup -o MyGame  # -> MyGame/{code,content,meta}
+converter/target/release/cia2wiiu "My Game.cia" --format wup --pack --common-key wiiu_common_key.txt -o MyGame
+                                                     # -> MyGame/{title.tmd,title.tik,title.cert,*.app,*.h3}
 ```
 
 On Windows the program is `converter\target\release\cia2wiiu.exe`. It finds the kit in `kit/` next to or above itself, or in the current folder. `--kit` or `ZAKURO_WIIU_KIT` names another one.
@@ -118,7 +120,13 @@ Each conversion goes through these steps:
 
 **`.wuhb`:** copy it to `sd:/wiiu/apps/` and it shows up on the Wii U menu under Aroma.
 
-**`--format wup`:** gives you `code/` (the RPX, `app.xml` and `cos.xml`), `content/game.cxi` and `meta/` (`meta.xml` plus icon and splash TGAs). Pack that with NUSPacker and install the result with WUP Installer GX2 or a similar tool. Packing needs the Wii U common key, which you supply yourself.
+**`--format wup`:** gives you `code/` (the RPX, `app.xml` and `cos.xml`), `content/game.cxi` and `meta/` (`meta.xml` plus icon and splash TGAs). That is an unpacked title. Add `--pack` to get an installable WUP instead (see below). To pack a folder you converted earlier without converting again, run `cia2wiiu pack <folder> -o <wup folder> --common-key <file>` (it takes `--title-key` and `--cert` too, and packs in seconds). NUSPacker works on the folder as well.
+
+**`--format wup --pack`:** packs the title into a WUP the way NUSPacker does: `title.tmd`, `title.tik`, `title.cert`, the encrypted contents `00000000.app` … `0000000X.app`, and an `.h3` hash table for each hashed content. Only the WUP goes in the output folder. The unpacked title goes in the work folder and is deleted afterwards, unless you pass `--keep`. Copy the folder to `sd:/install/` and install it with WUP Installer GX2. The console needs signature patches, which Aroma and Mocha provide, because the TMD and the ticket are not signed by Nintendo.
+
+- **The Wii U common key.** Packing encrypts the title key with it, so you must supply it yourself. Pass `--common-key <file>` or set `WIIU_COMMON_KEY_FILE=<file>`. The file holds the 16-byte key, either as 16 raw bytes or as 32 hex digits (spaces and a newline are fine). It is part of your console's OTP, which dump tools such as dumpling save as `otp.bin`. Nothing here includes, downloads or prints the key.
+- **The title key** that encrypts the contents is random for each pack. `--title-key <32 hex digits>` sets it. It is stored in the ticket, encrypted with the common key, and the converter never prints it.
+- **`title.cert`.** Like NUSPacker, the converter writes a stand-in certificate chain with the right layout (CA00000003, signed by Root, then CP0000000b and XS0000000c, signed by Root-CA00000003) but no real keys or signatures. Signature-patched installs don't check it. If an installer rejects it anyway, copy `title.cert` from any title you dumped from your own console and pass it with `--cert <title.cert>`. The converter copies that file instead.
 
 `--rom-on-sd` leaves the 3DS game out of the bundle. You then copy the `.cxi` it writes to `sd:/wiiu/zakuro/<title id>/game.cxi`.
 
