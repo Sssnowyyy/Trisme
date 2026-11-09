@@ -89,6 +89,10 @@ Save data goes to `sd:/wiiu/zakuro/`.
 ## Notes and limits
 
 - **Graphics** are drawn by Zakuro's software rasterizer on the CPU. The Vulkan renderer isn't available on the Wii U, and a GX2 renderer would be the next big step for speed.
-- **Code size.** Recompiled code is large: about 22 bytes of PowerPC per byte of ARM at `-O2`, and 23% less at `-Os`. See `docs/` and the converter's output for the sizes it reports.
+- **Code size decides the format.** Recompiled code is large: about 22 bytes of PowerPC per byte of ARM at `-O2`, and 23% less at `-Os`, which is the default (`--optimize speed` switches to `-O2`).
+  - Aroma starts every `.wuhb` in place of Health & Safety, with a code area fixed at 64 MiB whatever the bundle says. About 56 MiB of that is usable for the program. The converter refuses to write a `.wuhb` past that limit; `--allow-large` writes it anyway.
+  - An installed title (`--format wup`) sets its own `max_codesize` in `cos.xml`, up to the system's 224 MiB. The converter sizes it as the code + 10% + 8 MiB.
+  - Big commercial games will usually need `--format wup`.
+  - Cemu doesn't enforce the 64 MiB limit, so a `.wuhb` that is too big still runs there. On a console it fails with "Could not allocate uncompressed text".
 - **Not supported on the Wii U:** local wireless and rooms, cameras, the microphone, texture packs and the 3D effect.
 - **Distribution.** Converted games contain the game's code and data. They are for your own use only. Don't share them.

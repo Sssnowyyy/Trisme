@@ -47,6 +47,8 @@ options:
   --name <text>           the name shown on the menu
   --work <dir>            where intermediate files go (default: next to output)
   --keep                  keep the intermediate files
+  --allow-large           write a .wuhb even when its code is past what Aroma
+                          loads (about 56 MiB); it will fail on the console
   --new3ds                run as a New 3DS (titles that need it get it anyway)
 ";
 
@@ -66,6 +68,7 @@ struct Options {
     keep: bool,
     new3ds: bool,
     optimize_size: bool,
+    allow_large: bool,
 }
 
 fn parse() -> Result<Options, String> {
@@ -86,6 +89,7 @@ fn parse() -> Result<Options, String> {
         keep: false,
         new3ds: false,
         optimize_size: true,
+        allow_large: false,
     };
     let mut rom = None;
     while let Some(arg) = args.next() {
@@ -128,6 +132,7 @@ fn parse() -> Result<Options, String> {
             "--work" => options.work = Some(value(&arg)?.into()),
             "--keep" => options.keep = true,
             "--new3ds" => options.new3ds = true,
+            "--allow-large" => options.allow_large = true,
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}\n\n{USAGE}")),
             _ if rom.is_none() => rom = Some(PathBuf::from(arg)),
             _ => return Err(format!("one game at a time; {arg} is extra")),
@@ -264,6 +269,7 @@ fn convert(options: &Options) -> Result<(), String> {
     run(Command::new(&toolchain.elf2rpl).arg(&stripped).arg(&rpx), "elf2rpl")?;
     let code_size = text_size(&toolchain, &stripped).unwrap_or(0);
     println!("    {} ({:.1} MiB, {:.1} MiB of code)", rpx.display(), file_mib(&rpx), code_size as f64 / (1 << 20) as f64);
+    check_code_size(code_size, options)?;
 
     // the game on the SD card instead of in the bundle
     if options.rom_on_sd {
@@ -359,7 +365,45 @@ fn move_file(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::remove_file(from).map_err(|e| format!("could not remove {}, {e}", from.display()))
 }
 
-/// the size of the program's executable sections, from objdump's headers.
+/// Aroma starts a .wuhb in place of Health & Safety with a code heap Mocha
+/// sets to 64 MiB whatever the bundle says; the system's own non-shared
+/// libraries (sndcore2, proc_ui, nn_*) and the loader's tracking come out of
+/// it too, so this much is what a .wuhb's own code can use.
+const WUHB_CODE_LIMIT: u64 = 56 << 20;
+/// the most code any title's cos.xml may ask for, 0x0E000000, less room for
+/// the system libraries.
+const WUP_CODE_LIMIT: u64 = 0x0E00_0000 - (16 << 20);
+
+fn check_code_size(code: u64, options: &Options) -> Result<(), String> {
+    let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+    if code > WUP_CODE_LIMIT {
+        return Err(format!(
+            "the program has {:.1} MiB of code, more than any Wii U title can load ({:.0} MiB); \
+             try --optimize size, or --interpreter",
+            mib(code),
+            mib(WUP_CODE_LIMIT)
+        ));
+    }
+    if !options.wup && code > WUHB_CODE_LIMIT {
+        let message = format!(
+            "the program has {:.1} MiB of code, but Aroma loads a .wuhb with a 64 MiB code area (about {:.0} MiB of it for the \
+             program), so it would fail on the console with \"Could not allocate uncompressed text\" (Cemu doesn't enforce \
+             this, so it would seem to work there). make an installed title instead with --format wup, whose cos.xml asks \
+             for the room it needs{}",
+            mib(code),
+            mib(WUHB_CODE_LIMIT),
+            if options.optimize_size { "" } else { ", or try --optimize size" }
+        );
+        if options.allow_large {
+            println!("    warning: {message}");
+        } else {
+            return Err(format!("{message}. --allow-large writes the .wuhb anyway."));
+        }
+    }
+    Ok(())
+}
+
+/// the size of the program's .text, from objdump's headers.
 fn text_size(toolchain: &Toolchain, elf: &Path) -> Option<u64> {
     let objdump = toolchain.gcc.with_file_name(if cfg!(windows) { "powerpc-eabi-objdump.exe" } else { "powerpc-eabi-objdump" });
     let output = Command::new(objdump).arg("-h").arg(elf).output().ok()?;
@@ -368,7 +412,7 @@ fn text_size(toolchain: &Toolchain, elf: &Path) -> Option<u64> {
     let mut total = 0u64;
     for pair in lines.windows(2) {
         let fields: Vec<&str> = pair[0].split_whitespace().collect();
-        if fields.len() >= 3 && pair[1].contains("CODE") {
+        if fields.len() >= 3 && fields[1] == ".text" && pair[1].contains("CODE") {
             total += u64::from_str_radix(fields[2], 16).unwrap_or(0);
         }
     }

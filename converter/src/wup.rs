@@ -67,9 +67,13 @@ fn app_xml(info: &WupInfo) -> String {
 }
 
 fn cos_xml(info: &WupInfo) -> String {
-    // the code area: what the RPX needs and a margin, in MiB steps, within
-    // what the loader allows a title
-    let code = (info.code_size + (8 << 20)).next_multiple_of(1 << 20).clamp(0x0080_0000, 0x0E00_0000);
+    // the code area holds the RPX's text, the non-shared system libraries
+    // (sndcore2, proc_ui, nn_*...), the compressed relocations while loading
+    // and the loader's tracking: the text, a tenth more and 8 MiB, in MiB
+    // steps, within the 0x0E000000 the loader allows. no codegen area, as
+    // codegen and code together may not pass 0x0E800000, and every byte of
+    // it comes out of the data area
+    let code = (info.code_size + info.code_size / 10 + (8 << 20)).next_multiple_of(1 << 20).clamp(0x0100_0000, 0x0E00_0000);
     let mut permissions = String::new();
     for (index, group) in [1u32, 3, 9, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23].iter().enumerate() {
         let _ = writeln!(
@@ -246,7 +250,8 @@ mod tests {
         assert!(meta.contains("WUP-N-BZLE"));
         let cos = cos_xml(&info);
         assert!(cos.contains("<argstr type=\"string\" length=\"4096\">game.rpx</argstr>"));
-        assert!(cos.contains("<max_codesize type=\"hexBinary\" length=\"4\">03000000</max_codesize>"));
+        assert!(cos.contains("<max_codesize type=\"hexBinary\" length=\"4\">03400000</max_codesize>"));
+        assert!(cos.contains("<codegen_size type=\"hexBinary\" length=\"4\">00000000</codegen_size>"));
         assert!(app_xml(&info).contains("<group_id type=\"hexBinary\" length=\"4\">00003456</group_id>"));
     }
 }
