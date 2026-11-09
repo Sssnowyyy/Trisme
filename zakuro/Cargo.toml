@@ -27,7 +27,8 @@ log = "0.4"
 thiserror = "2"
 bitflags = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
-recomp-abi = { git = "https://github.com/fearkov/3dsrecomp" }
+# the "load" feature (dlopen) is turned on by the crates that use it, per target
+recomp-abi = { path = "../3dsrecomp/abi", default-features = false }
 rayon = "1"
 memmap2 = "0.9"
 bytemuck = { version = "1", features = ["derive"] }

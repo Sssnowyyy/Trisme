@@ -199,7 +199,13 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
         }
     }
 
+    #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
     let mut on_gpu = false;
+    #[cfg(not(feature = "vulkan"))]
+    if system.config.hardware_renderer {
+        log::warn!("this build has no Vulkan renderer, drawing in software");
+    }
+    #[cfg(feature = "vulkan")]
     if system.config.hardware_renderer {
         match system.gpu.enable_hardware_renderer(system.config.resolution, system.config.device.clone(), Some(title.program_id())) {
             Ok(name) => {

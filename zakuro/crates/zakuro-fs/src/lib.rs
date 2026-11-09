@@ -16,9 +16,11 @@ pub mod romfs_build;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(not(target_vendor = "wiiu"))]
 use memmap2::Mmap;
 
 pub use cia::{version_name, Cia, Content, TitleKind};
@@ -82,15 +84,22 @@ pub enum FsError {
     PatchMismatch,
 }
 
-/// a memory-mapped ROM file. Games are up to 4 GiB, so nothing is read eagerly.
+/// a ROM file. Games are up to 4 GiB, so nothing is read eagerly: on the
+/// desktop it is memory-mapped, on the Wii U (no mmap, ~1 GiB of RAM) every
+/// read goes to the file.
 pub struct RomImage {
     path: PathBuf,
+    #[cfg(not(target_vendor = "wiiu"))]
     map: Mmap,
+    #[cfg(target_vendor = "wiiu")]
+    file: std::sync::Mutex<std::fs::File>,
+    #[cfg(target_vendor = "wiiu")]
+    len: u64,
 }
 
 impl std::fmt::Debug for RomImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RomImage").field("path", &self.path).field("len", &self.map.len()).finish()
+        f.debug_struct("RomImage").field("path", &self.path).field("len", &self.len()).finish()
     }
 }
 
@@ -98,27 +107,162 @@ impl RomImage {
     pub fn open(path: impl AsRef<Path>) -> Result<RomImage, FsError> {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
-        // SAFETY: the ROM is a regular file we only ever read.
-        let map = unsafe { Mmap::map(&file)? };
-        Ok(RomImage { path, map })
+        #[cfg(not(target_vendor = "wiiu"))]
+        {
+            // SAFETY: the ROM is a regular file we only ever read.
+            let map = unsafe { Mmap::map(&file)? };
+            Ok(RomImage { path, map })
+        }
+        #[cfg(target_vendor = "wiiu")]
+        {
+            let len = file.metadata()?.len();
+            Ok(RomImage { path, file: std::sync::Mutex::new(file), len })
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn data(&self) -> &[u8] {
-        &self.map
+    /// fills out with the bytes at offset, an error when they run past the
+    /// end of the file.
+    pub fn read_at(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        let past = || std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "read past the end of the ROM image");
+        let end = offset.checked_add(out.len() as u64).ok_or_else(past)?;
+        if end > self.len() {
+            return Err(past());
+        }
+        #[cfg(not(target_vendor = "wiiu"))]
+        out.copy_from_slice(&self.map[offset as usize..end as usize]);
+        #[cfg(target_vendor = "wiiu")]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = self.file.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(out)?;
+        }
+        Ok(())
     }
 
-    pub fn len(&self) -> usize {
-        self.map.len()
+    /// len bytes at offset, borrowed from the map where there is one, none
+    /// when they run past the end of the file.
+    pub fn bytes(&self, offset: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+        let end = offset.checked_add(len as u64)?;
+        if end > self.len() {
+            return None;
+        }
+        #[cfg(not(target_vendor = "wiiu"))]
+        return Some(Cow::Borrowed(&self.map[offset as usize..end as usize]));
+        #[cfg(target_vendor = "wiiu")]
+        {
+            let mut out = vec![0; len];
+            self.read_at(offset, &mut out).ok()?;
+            Some(Cow::Owned(out))
+        }
+    }
+
+    /// up to len bytes at offset, fewer where the file ends, for headers
+    /// whose parsers check the length themselves.
+    pub fn head(&self, offset: u64, len: usize) -> Result<Cow<'_, [u8]>, FsError> {
+        let len = (len as u64).min(self.len().saturating_sub(offset)) as usize;
+        self.bytes(offset, len).ok_or(FsError::Truncated { offset: offset as usize, len: self.len() as usize })
+    }
+
+    pub fn len(&self) -> u64 {
+        #[cfg(not(target_vendor = "wiiu"))]
+        return self.map.len() as u64;
+        #[cfg(target_vendor = "wiiu")]
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
     }
 }
+
+/// something a parser reads at offsets, a ROM image or bytes in memory.
+pub trait ReadAt {
+    fn size(&self) -> u64;
+
+    /// fills out with the bytes at offset, Truncated when they run past the
+    /// end.
+    fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FsError>;
+
+    /// len bytes at offset, owned.
+    fn vec_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+        let mut out = vec![0; len];
+        self.read_exact_at(offset, &mut out)?;
+        Ok(out)
+    }
+}
+
+impl ReadAt for [u8] {
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FsError> {
+        let bytes = usize::try_from(offset)
+            .ok()
+            .and_then(|start| self.get(start..start.checked_add(out.len())?))
+            .ok_or(FsError::Truncated { offset: offset as usize, len: self.len() })?;
+        out.copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl ReadAt for Vec<u8> {
+    fn size(&self) -> u64 {
+        self.as_slice().size()
+    }
+
+    fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FsError> {
+        self.as_slice().read_exact_at(offset, out)
+    }
+}
+
+impl ReadAt for RomImage {
+    fn size(&self) -> u64 {
+        self.len()
+    }
+
+    fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FsError> {
+        self.read_at(offset, out).map_err(|error| match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => FsError::Truncated { offset: offset as usize, len: self.len() as usize },
+            _ => FsError::Io(error),
+        })
+    }
+}
+
+/// a stretch of something read at offsets, read as a whole of its own.
+pub struct Window<'a, S: ?Sized> {
+    source: &'a S,
+    offset: u64,
+    len: u64,
+}
+
+impl<'a, S: ReadAt + ?Sized> Window<'a, S> {
+    pub fn new(source: &'a S, offset: u64, len: u64) -> Self {
+        Window { source, offset, len }
+    }
+}
+
+impl<S: ReadAt + ?Sized> ReadAt for Window<'_, S> {
+    fn size(&self) -> u64 {
+        self.len
+    }
+
+    fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FsError> {
+        if offset.checked_add(out.len() as u64).is_none_or(|end| end > self.len) {
+            return Err(FsError::Truncated { offset: offset as usize, len: self.len as usize });
+        }
+        self.source.read_exact_at(self.offset + offset, out)
+    }
+}
+
+/// how much of the start of a file the container formats are told apart by,
+/// enough for a CIA's header.
+const HEAD: usize = 0x4000;
 
 /// a loaded title, the executable NCCH of a cartridge, with its headers parsed
 /// and its filesystems located.
@@ -128,6 +272,8 @@ pub struct Title {
     ncch_offset: u64,
     pub ncch: NcchHeader,
     pub exheader: ExHeader,
+    /// the exheader's bytes that describe the program, read once.
+    exheader_raw: Vec<u8>,
     pub exefs: ExeFs,
     exefs_offset: u64,
     pub romfs: Option<RomFs>,
@@ -148,10 +294,10 @@ pub struct Update {
 impl Update {
     pub fn load(path: impl AsRef<Path>) -> Result<Update, FsError> {
         let image = Arc::new(RomImage::open(path)?);
-        if !Cia::detect(image.data()) {
+        if !Cia::detect(&image.head(0, HEAD)?) {
             return Err(FsError::BadCia("an update comes as a CIA"));
         }
-        let cia = Cia::read(image.data())?;
+        let cia = Cia::read(&*image)?;
         if cia.kind() != TitleKind::Update {
             return Err(FsError::BadCia("it is not an update"));
         }
@@ -178,10 +324,10 @@ pub struct Dlc {
 impl Dlc {
     pub fn load(path: impl AsRef<Path>) -> Result<Dlc, FsError> {
         let image = Arc::new(RomImage::open(path)?);
-        if !Cia::detect(image.data()) {
+        if !Cia::detect(&image.head(0, HEAD)?) {
             return Err(FsError::BadCia("DLC comes as a CIA"));
         }
-        let cia = Cia::read(image.data())?;
+        let cia = Cia::read(&*image)?;
         if cia.kind() != TitleKind::Dlc {
             return Err(FsError::BadCia("it is not DLC"));
         }
@@ -200,8 +346,8 @@ impl Dlc {
     /// out or it has no RomFS it can read.
     pub fn romfs(&self, index: u16) -> Option<(u64, u64)> {
         let offset = self.contents.iter().find(|content| content.index == index)?.offset?;
-        let data = self.image.data();
-        let ncch = NcchHeader::parse(data.get(offset as usize..)?).ok()?;
+        let data = &*self.image;
+        let ncch = NcchHeader::parse(&data.head(offset, NcchHeader::SIZE).ok()?).ok()?;
         if !ncch.has_romfs() || (!ncch.is_decrypted() && ncch.crypto_method() != 0) {
             return None;
         }
@@ -213,7 +359,8 @@ impl Dlc {
 impl Title {
     pub fn load(path: impl AsRef<Path>) -> Result<Title, FsError> {
         let image = Arc::new(RomImage::open(path)?);
-        let data = image.data();
+        let head = image.head(0, HEAD)?;
+        let data = &*head;
 
         let ncch_offset = if Ncsd::detect(data) {
             let ncsd = Ncsd::parse(data)?;
@@ -224,7 +371,7 @@ impl Title {
             );
             ncsd.executable_partition()?.offset
         } else if Cia::detect(data) {
-            let cia = Cia::parse(data)?;
+            let cia = Cia::parse(&*image)?;
             log::info!("CIA archive, title {:016X}", cia.title_id);
             cia.executable().ok_or(FsError::NoExecutablePartition)?.0
         } else if NcchHeader::detect(data) {
@@ -232,24 +379,27 @@ impl Title {
         } else {
             return Err(FsError::UnknownFormat);
         };
+        drop(head);
         Title::from_image(image, ncch_offset)
     }
 
     /// the title whose NCCH is at ncch_offset in image.
     fn from_image(image: Arc<RomImage>, ncch_offset: u64) -> Result<Title, FsError> {
-        let data = image.data();
-        let ncch_data = data.get(ncch_offset as usize..).ok_or(FsError::NoExecutablePartition)?;
-        let ncch = NcchHeader::parse(ncch_data)?;
+        let data = &*image;
+        if ncch_offset > data.len() {
+            return Err(FsError::NoExecutablePartition);
+        }
+        let ncch = NcchHeader::parse(&data.head(ncch_offset, NcchHeader::SIZE)?)?;
 
         if !ncch.is_decrypted() && ncch.crypto_method() != 0 {
             return Err(FsError::Encrypted(ncch.crypto_method()));
         }
 
-        let exheader_raw = &ncch_data[NcchHeader::SIZE..NcchHeader::SIZE + ExHeader::HASHED_SIZE];
-        let exheader = ExHeader::parse(exheader_raw)?;
+        let exheader_raw = data.vec_at(ncch_offset + NcchHeader::SIZE as u64, ExHeader::HASHED_SIZE)?;
+        let exheader = ExHeader::parse(&exheader_raw)?;
 
         let exefs_offset = ncch_offset + ncch.exefs_offset;
-        let exefs = ExeFs::parse(&data[exefs_offset as usize..])?;
+        let exefs = ExeFs::parse(&data.head(exefs_offset, exefs::HEADER_SIZE as usize)?)?;
 
         // a game reads its data from the RomFS, without one that reads it
         // stops on its first file
@@ -266,6 +416,7 @@ impl Title {
             ncch_offset,
             ncch,
             exheader,
+            exheader_raw,
             exefs,
             exefs_offset,
             romfs,
@@ -300,8 +451,7 @@ impl Title {
         if let Some(update) = &self.update {
             return update.title.exheader_bytes();
         }
-        let start = self.ncch_offset as usize + NcchHeader::SIZE;
-        &self.image.data()[start..start + ExHeader::HASHED_SIZE]
+        &self.exheader_raw
     }
 
     /// lays the mod in dir over the RomFS. what it changed, when it changed
@@ -310,7 +460,7 @@ impl Title {
         let Some(romfs) = &self.romfs else {
             return Ok(None);
         };
-        let layered = layered::Layered::new(romfs, self.image.data(), dir)?;
+        let layered = layered::Layered::new(romfs, &*self.image, dir)?;
         let changes = layered.as_ref().map(|layered| layered.changes);
         self.layered = layered.map(std::sync::Arc::new);
         Ok(changes)
@@ -325,14 +475,13 @@ impl Title {
     }
 
     /// raw bytes of an ExeFS entry, from the update when it has it.
-    pub fn exefs_file(&self, name: &str) -> Option<&[u8]> {
+    pub fn exefs_file(&self, name: &str) -> Option<Cow<'_, [u8]>> {
         if let Some(file) = self.update.as_ref().and_then(|update| update.title.exefs_file(name)) {
             return Some(file);
         }
         let entry = self.exefs.find(name)?;
-        let start = (self.exefs_offset + exefs::HEADER_SIZE + entry.offset) as usize;
-        let end = start.checked_add(entry.size as usize)?;
-        self.image.data().get(start..end)
+        let start = self.exefs_offset + exefs::HEADER_SIZE + entry.offset;
+        self.image.bytes(start, usize::try_from(entry.size).ok()?)
     }
 
     /// the executable image, decompressed if the exheader says it is BLZ'd,
@@ -343,22 +492,21 @@ impl Title {
         }
         let raw = self.exefs_file(".code").ok_or(FsError::NoCode)?;
         if self.exheader.compress_code {
-            lz77::decompress(raw)
+            lz77::decompress(&raw)
         } else {
-            Ok(raw.to_vec())
+            Ok(raw.into_owned())
         }
     }
 
     /// reads len bytes at offset from a RomFS file.
-    pub fn read_romfs(&self, file: &romfs::FileEntry, offset: u64, len: usize) -> Option<&[u8]> {
+    pub fn read_romfs(&self, file: &romfs::FileEntry, offset: u64, len: usize) -> Option<Cow<'_, [u8]>> {
         let fs = self.romfs.as_ref()?;
         if offset >= file.data_size {
-            return Some(&[]);
+            return Some(Cow::Borrowed(&[]));
         }
-        let avail = (file.data_size - offset) as usize;
-        let len = len.min(avail);
-        let start = (fs.file_data_offset(file) + offset) as usize;
-        self.image.data().get(start..start.checked_add(len)?)
+        let len = (len as u64).min(file.data_size - offset) as usize;
+        let start = fs.file_data_offset(file) + offset;
+        self.image.bytes(start, len)
     }
 
     pub fn program_id(&self) -> u64 {
@@ -417,7 +565,7 @@ mod addon_tests {
         let image = dlc.image();
         for (index, path, data) in [(0, "quests/1.bin", &b"one"[..]), (2, "quests/3.bin", b"three")] {
             let (offset, size) = dlc.romfs(index).unwrap();
-            let window = &image.data()[offset as usize..(offset + size) as usize];
+            let window = &*image.bytes(offset, size as usize).unwrap();
             let romfs = RomFs::parse_level3(window, 0).unwrap();
             let file = romfs.lookup(path).unwrap();
             let at = romfs.file_data_offset(&file) as usize;

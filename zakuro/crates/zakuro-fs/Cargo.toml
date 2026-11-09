@@ -12,5 +12,12 @@ testing = []
 zakuro-common.workspace = true
 log.workspace = true
 thiserror.workspace = true
-memmap2.workspace = true
 crc32fast = "1"
+
+# the ROM mapped rather than read; the Wii U has no mmap
+[target.'cfg(not(target_vendor = "wiiu"))'.dependencies]
+memmap2.workspace = true
+
+[lints.rust]
+# the Wii U target's vendor, which code for it is gated on
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("wiiu"))'] }

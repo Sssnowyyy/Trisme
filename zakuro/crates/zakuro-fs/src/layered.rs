@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use crate::romfs::RomFs;
 use crate::romfs_build::{self, Dir, File};
-use crate::{patch, FsError};
+use crate::{patch, FsError, ReadAt};
 
 /// what a mod changed in the RomFS.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +63,7 @@ impl std::fmt::Debug for Layered {
 impl Layered {
     /// romfs, a RomFS in image, with the mod in dir over it. None when the
     /// mod changes nothing in it.
-    pub fn new(romfs: &RomFs, image: &[u8], dir: &Path) -> Result<Option<Layered>, FsError> {
+    pub fn new<S: ReadAt + ?Sized>(romfs: &RomFs, image: &S, dir: &Path) -> Result<Option<Layered>, FsError> {
         let mut tree = Tree::read(romfs)?;
         let content = tree.content();
         let mut changes = Changes::default();
@@ -92,7 +92,7 @@ impl Layered {
 
     /// reads the layered image from offset into out, image being the ROM's
     /// bytes. how many bytes there were to read.
-    pub fn read(&self, image: &[u8], offset: u64, out: &mut [u8]) -> usize {
+    pub fn read<S: ReadAt + ?Sized>(&self, image: &S, offset: u64, out: &mut [u8]) -> usize {
         if offset >= self.size {
             return 0;
         }
@@ -119,9 +119,8 @@ impl Layered {
             let within = from - piece.start;
             match &piece.source {
                 Source::Image(at) => {
-                    let start = (at + within) as usize;
-                    if let Some(bytes) = image.get(start..start + dest.len()) {
-                        dest.copy_from_slice(bytes);
+                    if image.read_exact_at(at + within, dest).is_err() {
+                        dest.fill(0);
                     }
                 }
                 Source::Memory(data) => dest.copy_from_slice(&data[within as usize..within as usize + dest.len()]),
@@ -269,7 +268,7 @@ impl Tree {
     }
 
     /// the patches and stubs in host, for the files of the directory at.
-    fn patch(&mut self, host: &Path, at: usize, game: (&RomFs, &[u8]), changes: &mut Changes) -> Result<(), FsError> {
+    fn patch<S: ReadAt + ?Sized>(&mut self, host: &Path, at: usize, game: (&RomFs, &S), changes: &mut Changes) -> Result<(), FsError> {
         for (path, name) in entries(host)? {
             if path.is_dir() {
                 match self.find_dir(at, &name) {
@@ -313,15 +312,14 @@ impl Tree {
 
     /// a leaf's bytes as they are now, a patch goes over what romfs/ put
     /// there when it put something.
-    fn data(&self, leaf: usize, (romfs, image): (&RomFs, &[u8])) -> Result<Vec<u8>, FsError> {
+    fn data<S: ReadAt + ?Sized>(&self, leaf: usize, (romfs, image): (&RomFs, &S)) -> Result<Vec<u8>, FsError> {
         let leaf = &self.leaves[leaf];
         match (&leaf.modded, leaf.game) {
             (Some(Source::Host(path)), _) => Ok(std::fs::read(path)?),
             (Some(Source::Memory(data)), _) => Ok(data.clone()),
             (_, Some(at)) => {
-                let start = (romfs.base + romfs.header.file_data_offset as u64 + at) as usize;
-                let bytes = image.get(start..start + leaf.size as usize);
-                Ok(bytes.ok_or(FsError::BadRomFs("a file runs past the end of the image"))?.to_vec())
+                let start = romfs.base + romfs.header.file_data_offset as u64 + at;
+                image.vec_at(start, leaf.size as usize).map_err(|_| FsError::BadRomFs("a file runs past the end of the image"))
             }
             _ => Ok(Vec::new()),
         }

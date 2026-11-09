@@ -747,7 +747,7 @@ impl App {
             .iter()
             .find(|game| game.path == path)
             .map(|game| game.name.clone())
-            .or_else(|| Some(library::Smdh::parse(system.title.as_ref()?.exefs_file("icon")?)?.name).filter(|name| !name.is_empty()))
+            .or_else(|| Some(library::Smdh::parse(&system.title.as_ref()?.exefs_file("icon")?)?.name).filter(|name| !name.is_empty()))
             .or_else(|| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
             .unwrap_or_default();
         let mut game = Running::new(system, path.to_owned(), name);

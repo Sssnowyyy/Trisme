@@ -28,10 +28,6 @@ impl<'a> Reader<'a> {
         })
     }
 
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
     pub fn bytes(&self, offset: usize, len: usize) -> Result<&'a [u8], FsError> {
         let end = offset.checked_add(len).ok_or(FsError::Truncated {
             offset: self.base + offset,

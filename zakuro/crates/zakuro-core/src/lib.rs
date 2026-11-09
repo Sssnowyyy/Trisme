@@ -69,6 +69,7 @@ pub struct Config {
     pub resolution: u32,
     /// the Vulkan presenter's device, to draw on and show the screens
     /// straight from, when it can.
+    #[cfg(feature = "vulkan")]
     pub device: Option<std::sync::Arc<zakuro_gpu::SharedDevice>>,
     /// the time the console's clock starts at, in milliseconds since 1900,
     /// the host's when none, a fixed one makes runs repeat exactly.
@@ -112,6 +113,7 @@ impl Default for Config {
             dlc: Vec::new(),
             enhancements: std::collections::BTreeMap::new(),
             resolution: 1,
+            #[cfg(feature = "vulkan")]
             device: None,
             clock: None,
             interpolate: false,

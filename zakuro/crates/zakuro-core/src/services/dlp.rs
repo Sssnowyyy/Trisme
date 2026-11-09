@@ -288,11 +288,11 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
 /// starts the service, the child read off the card.
 fn initialize(system: &mut System, most: u8) {
     let child = system.title.as_ref().and_then(|title| {
-        let image = title.image().data();
+        let image = title.image();
         let (offset, size) = zakuro_fs::dlp::child_cia(image)?;
-        let cia = image.get(offset as usize..(offset + size) as usize)?;
-        let title_id = zakuro_fs::Cia::read(cia).ok()?.title_id;
-        let smdh = zakuro_fs::dlp::cia_icon(cia).map(<[u8]>::to_vec).unwrap_or_default();
+        let cia = zakuro_fs::Window::new(image, offset, size);
+        let title_id = zakuro_fs::Cia::read(&cia).ok()?.title_id;
+        let smdh = zakuro_fs::dlp::cia_icon(&cia).unwrap_or_default();
         Some((title_id, smdh, size))
     });
     match &child {

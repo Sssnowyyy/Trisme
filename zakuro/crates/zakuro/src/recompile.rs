@@ -264,7 +264,7 @@ fn update_modules(update: &zakuro_fs::Title, game: &zakuro_fs::RomFs) -> Vec<(St
             }
             let bytes = match modded.iter().find(|(at, _)| at.eq_ignore_ascii_case(&path)) {
                 Some((_, bytes)) => Some(bytes.clone()),
-                None => update.read_romfs(&file, 0, file.data_size as usize).map(<[u8]>::to_vec),
+                None => update.read_romfs(&file, 0, file.data_size as usize).map(std::borrow::Cow::into_owned),
             };
             modules.extend(bytes.map(|bytes| (path, bytes)));
         }

@@ -389,9 +389,16 @@ fn font_candidates() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// the Wii U has no fonts of its own a title can read, nor fc-match to run,
+/// the bitmap font stands in.
+#[cfg(target_vendor = "wiiu")]
+fn font_candidates() -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
 /// where Linux distributions put Noto's fonts for Japanese, the medium
 /// weight nearest the console's, or else the font fontconfig picks.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_vendor = "wiiu")))]
 fn font_candidates() -> Vec<std::path::PathBuf> {
     let folders = ["/usr/share/fonts/noto-cjk", "/usr/share/fonts/opentype/noto", "/usr/share/fonts/google-noto-cjk", "/usr/share/fonts/noto"];
     let mut paths: Vec<std::path::PathBuf> = ["NotoSansCJK-Medium.ttc", "NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc"]

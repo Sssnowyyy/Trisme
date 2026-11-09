@@ -4,7 +4,7 @@
 //! index 0 is the executable NCCH, the same as a cartridge's first partition.
 
 use crate::reader::Reader;
-use crate::FsError;
+use crate::{FsError, ReadAt};
 
 /// the header's size, which is also its first field.
 const HEADER_SIZE: u32 = 0x2020;
@@ -79,9 +79,11 @@ impl Cia {
         data.len() >= HEADER_SIZE as usize && data[..4] == HEADER_SIZE.to_le_bytes()
     }
 
-    /// any title's CIA, a game's, an update's or a DLC's.
-    pub fn read(data: &[u8]) -> Result<Cia, FsError> {
-        let r = Reader::new(data);
+    /// any title's CIA, a game's, an update's or a DLC's. only the header
+    /// and the TMD are read.
+    pub fn read<S: ReadAt + ?Sized>(data: &S) -> Result<Cia, FsError> {
+        let header = data.vec_at(0, data.size().min(HEADER_SIZE as u64) as usize)?;
+        let r = Reader::new(&header);
         let align = |n: u64| n.next_multiple_of(ALIGN);
         let certificates = r.u32(0x08)? as u64;
         let ticket = r.u32(0x0C)? as u64;
@@ -89,7 +91,9 @@ impl Cia {
         let tmd_offset = align(align(align(HEADER_SIZE as u64) + certificates) + ticket);
         let contents_offset = align(tmd_offset + tmd_size);
 
-        let tmd = r.at(tmd_offset as usize)?;
+        let tmd_size = tmd_size.min(data.size().checked_sub(tmd_offset).ok_or(FsError::Truncated { offset: tmd_offset as usize, len: data.size() as usize })?);
+        let tmd = data.vec_at(tmd_offset, tmd_size as usize)?;
+        let tmd = Reader::new(&tmd);
         // the signature's size goes by its type, padded to 64 bytes
         let signature = match tmd.u32_be(0)? & 0xFFFF {
             0x0000 | 0x0003 => 4 + 0x200 + 0x3C,
@@ -123,7 +127,7 @@ impl Cia {
     }
 
     /// a game's CIA, which has its executable as content 0, decrypted.
-    pub fn parse(data: &[u8]) -> Result<Cia, FsError> {
+    pub fn parse<S: ReadAt + ?Sized>(data: &S) -> Result<Cia, FsError> {
         let cia = Cia::read(data)?;
         match cia.kind() {
             TitleKind::Update => return Err(FsError::NotAGame("an update")),

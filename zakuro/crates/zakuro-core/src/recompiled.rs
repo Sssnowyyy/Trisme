@@ -24,7 +24,19 @@ pub fn installed(program_id: u64) -> Option<std::path::PathBuf> {
 /// whether the library at path is worth building again, having come from
 /// an older 3dsrecomp than this build has, or not running at all.
 pub fn outdated(path: &Path) -> bool {
-    !recomp_abi::Library::open(path).is_ok_and(|code| code.generation() >= recomp_abi::GENERATION)
+    !open_library(path).is_ok_and(|code| code.generation() >= recomp_abi::GENERATION)
+}
+
+/// opens a library of recompiled code, which takes a dynamic loader.
+#[cfg(not(target_vendor = "wiiu"))]
+fn open_library(path: &Path) -> Result<recomp_abi::Library, String> {
+    recomp_abi::Library::open(path)
+}
+
+/// the Wii U has no dynamic loader, its recompiled code is linked in.
+#[cfg(target_vendor = "wiiu")]
+fn open_library(path: &Path) -> Result<recomp_abi::Library, String> {
+    Err(format!("{} can't be opened, loading libraries is unsupported on Wii U, link the code in", path.display()))
 }
 
 /// recompiled code, and how much of its work it handed back.
@@ -233,7 +245,7 @@ fn store(cpu: &Cpu, ctx: &mut Context) {
 impl Library {
     /// a library 3dsrecomp built.
     pub fn open(path: &Path) -> Result<Library, String> {
-        recomp_abi::Library::open(path).map(Library::new)
+        open_library(path).map(Library::new)
     }
 
     /// the code linked into the program.

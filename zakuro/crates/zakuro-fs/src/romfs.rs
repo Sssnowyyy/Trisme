@@ -1,7 +1,7 @@
 //! RomFS, the read-only filesystem holding a game's assets.
 
 use crate::reader::Reader;
-use crate::FsError;
+use crate::{FsError, ReadAt};
 
 /// offsets into the RomFS image of the four metadata tables.
 #[derive(Debug, Clone, Copy)]
@@ -69,17 +69,20 @@ impl RomFs {
     }
 
     /// data is the whole backing image, romfs_offset points at the IVFC
-    /// header inside it.
-    pub fn parse(data: &[u8], romfs_offset: u64) -> Result<RomFs, FsError> {
-        let ivfc = Reader::new(data).at(romfs_offset as usize)?;
-        let level3_rel = Self::level3_offset(ivfc.bytes(0, ivfc.len().min(0x1000))?)?;
+    /// header inside it. only the headers and metadata tables are read.
+    pub fn parse<S: ReadAt + ?Sized>(data: &S, romfs_offset: u64) -> Result<RomFs, FsError> {
+        let available = data.size().checked_sub(romfs_offset).ok_or(FsError::Truncated { offset: romfs_offset as usize, len: data.size() as usize })?;
+        let ivfc = data.vec_at(romfs_offset, available.min(0x1000) as usize)?;
+        let level3_rel = Self::level3_offset(&ivfc)?;
         Self::parse_level3(data, romfs_offset + level3_rel)
     }
 
     /// parses an image that is already the level-3 directory structure, with no
     /// IVFC hash tree in front of it.
-    pub fn parse_level3(data: &[u8], base: u64) -> Result<RomFs, FsError> {
-        let r = Reader::new(data).at(base as usize)?;
+    pub fn parse_level3<S: ReadAt + ?Sized>(data: &S, base: u64) -> Result<RomFs, FsError> {
+        let available = data.size().checked_sub(base).ok_or(FsError::Truncated { offset: base as usize, len: data.size() as usize })?;
+        let raw_header = data.vec_at(base, available.min(0x28) as usize)?;
+        let r = Reader::new(&raw_header);
         let header_len = r.u32(0x00)?;
         if header_len != 0x28 {
             return Err(FsError::BadRomFs("level 3 header is not 0x28 bytes"));
@@ -96,15 +99,8 @@ impl RomFs {
             file_data_offset: r.u32(0x24)?,
         };
 
-        let dir_meta = r
-            .bytes(header.dir_meta_offset as usize, header.dir_meta_size as usize)?
-            .to_vec();
-        let file_meta = r
-            .bytes(
-                header.file_meta_offset as usize,
-                header.file_meta_size as usize,
-            )?
-            .to_vec();
+        let dir_meta = data.vec_at(base + header.dir_meta_offset as u64, header.dir_meta_size as usize)?;
+        let file_meta = data.vec_at(base + header.file_meta_offset as u64, header.file_meta_size as usize)?;
 
         Ok(RomFs {
             base,

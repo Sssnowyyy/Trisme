@@ -232,7 +232,7 @@ fn addon(path: &Path) -> Option<Result<Addon, String>> {
         return None;
     }
     let image = zakuro_fs::RomImage::open(path).ok()?;
-    let cia = zakuro_fs::Cia::read(image.data()).ok()?;
+    let cia = zakuro_fs::Cia::read(&image).ok()?;
     if cia.kind() == zakuro_fs::TitleKind::Game {
         return None;
     }
@@ -285,7 +285,7 @@ fn read_game(path: &Path, data_dir: Option<&Path>) -> Game {
         }
     };
     let program_id = title.program_id();
-    let smdh = title.exefs_file("icon").and_then(Smdh::parse);
+    let smdh = title.exefs_file("icon").as_deref().and_then(Smdh::parse);
     Game {
         path: path.to_owned(),
         name: smdh.as_ref().map(|s| s.name.clone()).filter(|name| !name.is_empty()).unwrap_or(file_name),

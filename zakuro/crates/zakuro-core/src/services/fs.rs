@@ -1191,14 +1191,14 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
                 return 0;
             }
             let count = (size as u64).min(total - offset) as usize;
-            let start = (base + offset) as usize;
-            let Some(slice) = image.data().get(start..start + count) else {
-                log::warn!("fs: read past the end of the ROM image");
-                return 0;
-            };
-            // copying through a temporary keeps the borrow of title from
+            // read through a buffer, the image is read from its file where
+            // it isn't mapped, and the buffer keeps the borrow of title from
             // overlapping the mutable borrow of memory.
-            let data = slice.to_vec();
+            let mut data = vec![0u8; count];
+            if let Err(error) = image.read_at(base + offset, &mut data) {
+                log::warn!("fs: read past the end of the ROM image, {error}");
+                return 0;
+            }
             system.write_from_service(dest, &data);
             count as u32
         }
@@ -1219,7 +1219,7 @@ fn read_file(system: &mut System, file_id: u32, offset: u64, size: u32, dest: u3
         }
         FileBacking::Layered(layered, image) => {
             let mut data = vec![0u8; (size as u64).min(layered.len().saturating_sub(offset)) as usize];
-            let count = layered.read(image.data(), offset, &mut data);
+            let count = layered.read(&*image, offset, &mut data);
             system.write_from_service(dest, &data[..count]);
             count as u32
         }
