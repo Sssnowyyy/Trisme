@@ -10,12 +10,12 @@
    all memory here is MEM2 from the default heap: it survives the HOME menu,
    which takes MEM1 and the foreground bucket away. */
 
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include <coreinit/cache.h>
+#include <coreinit/event.h>
+#include <coreinit/fastmutex.h>
 #include <coreinit/memdefaultheap.h>
 #include <gfd.h>
 #include <gx2/clear.h>
@@ -679,6 +679,13 @@ static void flush_touched(void) {
     }
 }
 
+/* hands the GPU back the way SDL left it: its shaders take their uniforms
+   from registers, and the shader mode may not be part of a context state,
+   so it's set back by hand */
+static void leave_gpu(void) {
+    GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_REGISTER);
+}
+
 static void run_batch(const ZwGx2Command *commands, uint32_t count, const uint32_t *readback, uint32_t readback_count) {
     GX2SetContextState(context);
     for (uint32_t i = 0; i < MAX_OBJECTS; i++) {
@@ -729,6 +736,7 @@ static void run_batch(const ZwGx2Command *commands, uint32_t count, const uint32
     }
     for (uint32_t i = 0; i < readback_count; i++) touch(readback[i]);
     flush_touched();
+    leave_gpu();
     GX2DrawDone();
     for (uint32_t i = 0; i < readback_count; i++) {
         Object *color = object(readback[i]);
@@ -738,9 +746,15 @@ static void run_batch(const ZwGx2Command *commands, uint32_t count, const uint32
 
 /* ---- handing batches over ---- */
 
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
-static int available, closing;
+/* coreinit's own waits throughout: a timed wait takes a plain relative
+   timeout here, with no clock to disagree about, so the main thread sleeps
+   between batches instead of risking a spin that would starve the threads
+   sharing its core */
+static OSFastMutex lock;
+static OSEvent job_ready;  /* a batch was submitted, or shutdown */
+static OSEvent job_done;   /* the batch ran, or shutdown */
+static int sync_ready;
+static volatile int available, closing;
 static struct {
     const ZwGx2Command *commands;
     uint32_t count;
@@ -749,77 +763,86 @@ static struct {
     int pending, done;
 } job;
 
+static void init_sync(void) {
+    if (sync_ready) return;
+    OSFastMutex_Init(&lock, "zw_gx2");
+    OSInitEvent(&job_ready, FALSE, OS_EVENT_MODE_AUTO);
+    OSInitEvent(&job_done, FALSE, OS_EVENT_MODE_AUTO);
+    sync_ready = 1;
+}
+
 int32_t zw_gx2_available(void) {
-    pthread_mutex_lock(&lock);
-    int32_t result = available && !closing;
-    pthread_mutex_unlock(&lock);
-    return result;
+    return available && !closing;
 }
 
 int32_t zw_gx2_submit(const ZwGx2Command *commands, uint32_t count, const uint32_t *readback, uint32_t readback_count) {
-    pthread_mutex_lock(&lock);
     if (!available || closing) {
         ring_used = 0;
-        pthread_mutex_unlock(&lock);
         return -1;
     }
+    OSFastMutex_Lock(&lock);
     job.commands = commands;
     job.count = count;
     job.readback = readback;
     job.readback_count = readback_count;
     job.done = 0;
     job.pending = 1;
-    pthread_cond_broadcast(&changed);
-    while (!job.done && !closing) pthread_cond_wait(&changed, &lock);
+    OSFastMutex_Unlock(&lock);
+    OSSignalEvent(&job_ready);
+    for (;;) {
+        OSWaitEvent(&job_done);
+        OSFastMutex_Lock(&lock);
+        int finished = job.done || closing;
+        OSFastMutex_Unlock(&lock);
+        if (finished) break;
+    }
+    OSFastMutex_Lock(&lock);
     int32_t result = job.done ? 0 : -1;
     job.pending = 0;
+    OSFastMutex_Unlock(&lock);
     ring_used = 0;
-    pthread_mutex_unlock(&lock);
     return result;
 }
 
+/* the waiting batch, 1 when there is one to run */
+static int take_job(void) {
+    OSFastMutex_Lock(&lock);
+    int waiting = job.pending && !job.done && !closing;
+    OSFastMutex_Unlock(&lock);
+    return waiting;
+}
+
 int32_t zw_gx2_service(uint32_t timeout_us) {
-    pthread_mutex_lock(&lock);
-    if (!available || closing) {
-        pthread_mutex_unlock(&lock);
-        return 0;
-    }
-    if (!job.pending || job.done) {
-        if (timeout_us == 0) {
-            pthread_mutex_unlock(&lock);
-            return 0;
-        }
-        struct timespec until;
-        clock_gettime(CLOCK_REALTIME, &until);
-        until.tv_nsec += (long)(timeout_us % 1000000u) * 1000;
-        until.tv_sec += timeout_us / 1000000u + until.tv_nsec / 1000000000;
-        until.tv_nsec %= 1000000000;
-        while ((!job.pending || job.done) && !closing) {
-            if (pthread_cond_timedwait(&changed, &lock, &until) != 0) break;
-        }
-        if (!job.pending || job.done || closing) {
-            pthread_mutex_unlock(&lock);
-            return 0;
-        }
+    if (!available || closing) return 0;
+    if (!take_job()) {
+        if (timeout_us == 0) return 0;
+        /* in slices of 1 ms (nanoseconds, as Cemu and decaf take them; were
+           it timer ticks, 16 ms), the caller asking again until its frame's
+           window is over, so the screens are never held up for long */
+        uint32_t slice = timeout_us < 1000 ? timeout_us : 1000;
+        OSWaitEventWithTimeout(&job_ready, (OSTime)slice * 1000);
+        if (!take_job()) return 0;
     }
     /* the console's thread waits on this batch and touches none of it */
-    pthread_mutex_unlock(&lock);
     run_batch(job.commands, job.count, job.readback, job.readback_count);
-    pthread_mutex_lock(&lock);
+    OSFastMutex_Lock(&lock);
     job.done = 1;
-    pthread_cond_broadcast(&changed);
-    pthread_mutex_unlock(&lock);
+    OSFastMutex_Unlock(&lock);
+    OSSignalEvent(&job_done);
     return 1;
 }
 
 void zw_gx2_shutdown(void) {
-    pthread_mutex_lock(&lock);
+    if (!sync_ready) return;
+    OSFastMutex_Lock(&lock);
     closing = 1;
-    pthread_cond_broadcast(&changed);
-    pthread_mutex_unlock(&lock);
+    OSFastMutex_Unlock(&lock);
+    OSSignalEvent(&job_done);
+    OSSignalEvent(&job_ready);
 }
 
 int32_t zw_gx2_init(void) {
+    init_sync();
     if (zw_gx2_shader_count < SHADER_COUNT) {
         WHBLogPrint("gx2: the program has no GX2 shaders (the kit was built without CafeGLSL); 3D is drawn on the CPU");
         return 0;
@@ -850,10 +873,9 @@ int32_t zw_gx2_init(void) {
     /* our own state; SDL sets its own again whenever it draws */
     GX2SetupContextStateEx(context, FALSE);
     common_state();
+    leave_gpu();
 
-    pthread_mutex_lock(&lock);
     available = 1;
-    pthread_mutex_unlock(&lock);
     WHBLogPrint("gx2: the 3D is drawn on the GPU");
     return 1;
 }

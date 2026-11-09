@@ -570,7 +570,17 @@ int main(int argc, char **argv) {
         }
         pump_audio();
 
-        const char *shown = message[0] ? message : (started && zakuro_wiiu_state() == ZW_STATE_LOADING ? "Loading..." : NULL);
+        /* while loading, what the console is doing, so a load that stalls
+           says where */
+        static char loading[320];
+        const char *shown = message[0] ? message : NULL;
+        if (!shown && started && zakuro_wiiu_state() == ZW_STATE_LOADING) {
+            char status[256];
+            status[0] = 0;
+            zakuro_wiiu_message(status, sizeof status);
+            snprintf(loading, sizeof loading, status[0] ? "Loading... %s" : "Loading...", status);
+            shown = loading;
+        }
         draw(&drc, plan.drc_top, plan.drc_bottom, shown);
         draw(&tv, plan.tv_top, plan.tv_bottom, shown);
         presented = OSGetSystemTime();

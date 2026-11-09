@@ -127,6 +127,8 @@ struct Shared {
     audio: Mutex<VecDeque<[i16; 2]>>,
     heartbeat: Mutex<Instant>,
     message: Mutex<String>,
+    /// the last thing the log said while loading, shown under "Loading..."
+    status: Mutex<String>,
     state: AtomicI32,
     stop: AtomicBool,
     /// the platform holds the console still, in the HOME menu.
@@ -143,6 +145,7 @@ fn shared() -> &'static Shared {
         audio: Mutex::new(VecDeque::with_capacity(MOST_AUDIO)),
         heartbeat: Mutex::new(Instant::now()),
         message: Mutex::new(String::new()),
+        status: Mutex::new(String::new()),
         state: AtomicI32::new(STATE_LOADING),
         stop: AtomicBool::new(false),
         paused: AtomicBool::new(false),
@@ -186,6 +189,12 @@ impl log::Log for Logger {
             log::Level::Debug => 4,
             log::Level::Trace => 5,
         };
+        let shared = shared();
+        if record.level() <= log::Level::Info && shared.state.load(Ordering::SeqCst) == STATE_LOADING {
+            if let Ok(mut status) = shared.status.try_lock() {
+                *status = record.args().to_string();
+            }
+        }
         let text = format!("[{}] {}: {}", record.level(), record.target(), record.args());
         let text = CString::new(text.replace('\0', " ")).unwrap_or_default();
         // SAFETY: the platform's logger takes a NUL-terminated string it
@@ -225,6 +234,7 @@ unsafe fn path_from(pointer: *const c_char) -> Option<PathBuf> {
 #[no_mangle]
 pub unsafe extern "C" fn zakuro_wiiu_start(params: *const ZwParams) -> i32 {
     init_logging();
+    install_panic_hook();
     let Some(params) = (unsafe { params.as_ref() }) else { return -1 };
     let Some(game) = (unsafe { path_from(params.game_path) }) else { return -2 };
     let data_dir = unsafe { path_from(params.data_dir) };
@@ -268,6 +278,34 @@ pub unsafe extern "C" fn zakuro_wiiu_start(params: *const ZwParams) -> i32 {
             -4
         }
     }
+}
+
+/// a panic, built with panic=abort, would end the program with its message
+/// unseen. this logs it and puts it on the screen instead; on any thread
+/// but the main one (the platform's, which calls in through the FFI) the
+/// panicking thread then sleeps for good rather than aborting, so the
+/// message stays up until the player closes the game.
+fn install_panic_hook() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    static MAIN: OnceLock<std::thread::ThreadId> = OnceLock::new();
+    let _ = MAIN.set(std::thread::current().id());
+    INSTALLED.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let thread = std::thread::current();
+            let message = format!("the console stopped: {info} (thread {})", thread.name().unwrap_or("unnamed"));
+            log::error!("{message}");
+            let shared = shared();
+            if let Ok(mut slot) = shared.message.try_lock() {
+                *slot = message;
+            }
+            shared.state.store(STATE_FAULTED, Ordering::SeqCst);
+            if MAIN.get() != Some(&thread.id()) {
+                loop {
+                    std::thread::park();
+                }
+            }
+        }));
+    });
 }
 
 fn fail(message: String) {
@@ -514,7 +552,9 @@ pub extern "C" fn zakuro_wiiu_state() -> i32 {
 /// buffer has room for size bytes, or is null.
 #[no_mangle]
 pub unsafe extern "C" fn zakuro_wiiu_message(buffer: *mut c_char, size: u32) -> u32 {
-    let message = shared().message.lock().unwrap();
+    let shared = shared();
+    // while loading, what it's doing; afterwards, why it stopped
+    let message = if shared.state.load(Ordering::SeqCst) == STATE_LOADING { shared.status.lock().unwrap() } else { shared.message.lock().unwrap() };
     let bytes = message.as_bytes();
     if !buffer.is_null() && size > 0 {
         let count = bytes.len().min(size as usize - 1);
