@@ -172,7 +172,10 @@ fn convert(options: &Options) -> Result<(), String> {
         Some(work) => work.clone(),
         None => output.with_file_name(format!("{stem}.cia2wiiu-work")),
     };
+    let fresh = !work.exists();
     std::fs::create_dir_all(&work).map_err(|e| format!("could not create {}, {e}", work.display()))?;
+    // a work folder this run made goes again when the run fails
+    let guard = WorkGuard { dir: fresh.then(|| work.clone()) };
     let content = work.join("content");
     std::fs::create_dir_all(&content).map_err(|e| format!("could not create {}, {e}", content.display()))?;
 
@@ -311,6 +314,7 @@ fn convert(options: &Options) -> Result<(), String> {
         println!("    put it in sd:/wiiu/apps/ and start it from the Wii U menu (Aroma)");
     }
 
+    std::mem::forget(guard);
     if !options.keep {
         std::fs::remove_dir_all(&work).map_err(|e| format!("could not clean up {}, {e}", work.display()))?;
     } else {
@@ -318,6 +322,18 @@ fn convert(options: &Options) -> Result<(), String> {
     }
     println!("done in {:.0?}", started.elapsed());
     Ok(())
+}
+
+struct WorkGuard {
+    dir: Option<PathBuf>,
+}
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }
 
 fn file_mib(path: &Path) -> f64 {

@@ -49,3 +49,78 @@ ssize_t getrandom(void *buffer, size_t length, unsigned int flags) {
     }
     return (ssize_t)length;
 }
+
+/* ---- pthread keys ----
+   devkitPPC's pthread_key_create/getspecific/setspecific forward to the
+   weak __syscall_tls_* hooks, which wut leaves out, so without these keys
+   fail with ENOSYS. Rust's std (has-thread-local false on this target) keeps
+   every thread_local! behind a pthread key, and aborts when it can't make
+   one. Each thread's values live in an array hung off one of coreinit's
+   per-thread specific slots. Destructors are kept but, as nothing tells us
+   a thread ended, not run: a thread's values leak when it exits, which the
+   runtime's few long-lived threads make harmless. */
+#include <stdlib.h>
+#include <coreinit/thread.h>
+
+#define ZW_TLS_KEYS 256
+#define ZW_TLS_SLOT OS_THREAD_SPECIFIC_13
+
+static volatile int tls_lock;
+static uint8_t tls_used[ZW_TLS_KEYS];
+static void (*tls_destructors[ZW_TLS_KEYS])(void *);
+
+static void tls_acquire(void) {
+    while (__atomic_test_and_set((void *)&tls_lock, __ATOMIC_ACQUIRE)) OSYieldThread();
+}
+
+static void tls_release(void) {
+    __atomic_clear((void *)&tls_lock, __ATOMIC_RELEASE);
+}
+
+static void **tls_values(int create) {
+    void **values = (void **)OSGetThreadSpecific(ZW_TLS_SLOT);
+    if (!values && create) {
+        values = calloc(ZW_TLS_KEYS, sizeof *values);
+        if (values) OSSetThreadSpecific(ZW_TLS_SLOT, values);
+    }
+    return values;
+}
+
+int __syscall_tls_create(uint32_t *key, void (*destructor)(void *)) {
+    tls_acquire();
+    /* key 0 is left out, some code takes 0 for "no key" */
+    for (uint32_t k = 1; k < ZW_TLS_KEYS; k++) {
+        if (!tls_used[k]) {
+            tls_used[k] = 1;
+            tls_destructors[k] = destructor;
+            tls_release();
+            *key = k;
+            return 0;
+        }
+    }
+    tls_release();
+    return EAGAIN;
+}
+
+int __syscall_tls_delete(uint32_t key) {
+    if (key == 0 || key >= ZW_TLS_KEYS) return EINVAL;
+    tls_acquire();
+    tls_used[key] = 0;
+    tls_destructors[key] = NULL;
+    tls_release();
+    return 0;
+}
+
+void *__syscall_tls_get(uint32_t key) {
+    if (key == 0 || key >= ZW_TLS_KEYS) return NULL;
+    void **values = tls_values(0);
+    return values ? values[key] : NULL;
+}
+
+int __syscall_tls_set(uint32_t key, const void *value) {
+    if (key == 0 || key >= ZW_TLS_KEYS) return EINVAL;
+    void **values = tls_values(1);
+    if (!values) return ENOMEM;
+    values[key] = (void *)value;
+    return 0;
+}

@@ -90,6 +90,16 @@ pub struct ZwParams {
     pub emu_core: i32,
 }
 
+// the layouts powerpc-eabi-gcc -meabi gives platform/zakuro_wiiu.h's structs
+#[cfg(target_vendor = "wiiu")]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<ZwInput>() == 28 && offset_of!(ZwInput, touch_x) == 22);
+    assert!(size_of::<ZwCode>() == 40 && offset_of!(ZwCode, entries) == 16 && offset_of!(ZwCode, present) == 36);
+    assert!(size_of::<ZwParams>() == 56 && offset_of!(ZwParams, code) == 8);
+    assert!(offset_of!(ZwParams, new3ds) == 48 && offset_of!(ZwParams, emu_core) == 52);
+};
+
 extern "C" {
     fn zw_platform_log(level: i32, message: *const c_char);
     fn zw_platform_thread_setup(core: i32);
@@ -326,7 +336,8 @@ fn console(start: Start) {
         if !sound.is_empty() {
             let mut audio = shared.audio.lock().unwrap();
             let excess = (audio.len() + sound.len()).saturating_sub(MOST_AUDIO);
-            audio.drain(..excess.min(audio.len()));
+            let excess = excess.min(audio.len());
+            audio.drain(..excess);
             audio.extend(sound.iter().copied());
         }
 
