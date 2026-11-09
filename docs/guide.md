@@ -93,7 +93,7 @@ tools/build-kit.sh                     # the runtime and platform layer for the 
 cd converter && cargo build --release  # the converter, for your computer
 ```
 
-For the GPU renderer, the kit also needs [CafeGLSL](https://github.com/Exzap/CafeGLSL/releases)'s offline shader compiler: take v1.0.0-rc1 or newer and the archive for your computer, e.g. `cafeglsl-1.0.0-rc1-macos-arm64.tar.xz` (not the `wiiu-ppc` one; v1.0.0-rc1 is a pre-release, so GitHub's "Latest" label points at v0.2.0, which has no macOS or Windows compiler) and pass its folder, `CAFEGLSL_DIR=/path/to/cafeglsl-... tools/build-kit.sh`. Without it the kit still builds, and games draw their 3D on the CPU. See [docs/gx2.md](docs/gx2.md).
+For the GPU renderer, the kit also needs [CafeGLSL](https://github.com/Exzap/CafeGLSL/releases)'s offline shader compiler: take v1.0.0-rc1 or newer and the archive for your computer, e.g. `cafeglsl-1.0.0-rc1-macos-arm64.tar.xz` (not the `wiiu-ppc` one; v1.0.0-rc1 is a pre-release, so GitHub's "Latest" label points at v0.2.0, which has no macOS or Windows compiler) and pass its folder, `CAFEGLSL_DIR=/path/to/cafeglsl-... tools/build-kit.sh`. Without it the kit still builds, and games draw their 3D on the CPU. See [docs/gx2.md](gx2.md).
 
 `tools/build-kit.sh` looks for devkitPro in `DEVKITPRO` (default `/opt/devkitpro`). `ZAKURO_WIIU_RUST` picks a toolchain other than `nightly`, `KIT_DIR` sets another output folder and `CARGO_TARGET_DIR` sets another build folder.
 
@@ -150,7 +150,7 @@ Save data goes to `sd:/wiiu/zakuro/`.
 
 ## Notes and limits
 
-- **Graphics** are drawn on the Wii U's GPU through GX2: rasterization, texturing, lighting, the combiners and blending. Vertex shading stays on the CPU. Games fall back to Zakuro's software rasterizer when the kit was built without CafeGLSL, with `--renderer cpu`, or with `renderer=0` in the game's `wiiu.cfg`. Details and limits are in [docs/gx2.md](docs/gx2.md).
+- **Graphics** are drawn on the Wii U's GPU through GX2: rasterization, texturing, lighting, the combiners and blending. Vertex shading stays on the CPU. Games fall back to Zakuro's software rasterizer when the kit was built without CafeGLSL, with `--renderer cpu`, or with `renderer=0` in the game's `wiiu.cfg`. Details and limits are in [docs/gx2.md](gx2.md).
 - **Code size decides the format.** Recompiled code is large: about 22 bytes of PowerPC per byte of ARM at `-O2`, and 23% less at `-Os`, which is the default (`--optimize speed` switches to `-O2`).
   - Aroma starts every `.wuhb` in place of Health & Safety, with a code area fixed at 64 MiB whatever the bundle says. About 56 MiB of that is usable for the program. The converter refuses to write a `.wuhb` past that limit; `--allow-large` writes it anyway.
   - An installed title (`--format wup`) sets its own `max_codesize` in `cos.xml`, up to the system's 224 MiB. The converter sizes it as the code + 10% + 8 MiB.
