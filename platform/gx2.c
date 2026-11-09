@@ -506,7 +506,10 @@ static void set_scissor(const int32_t scissor[4]) {
 /* what every draw of ours wants, whatever the last one left */
 static void common_state(void) {
     GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK);
-    GX2SetRasterizerClipControlHalfZ(TRUE, TRUE, TRUE);
+    /* OpenGL's clip z (raster.vert writes it so) and no clipping by depth:
+       the PICA clamps depth, which Latte does to the viewport's 0..1 when
+       z clipping is off */
+    GX2SetRasterizerClipControl(TRUE, FALSE);
     GX2SetCullOnlyControl(GX2_FRONT_FACE_CCW, FALSE, FALSE);
     GX2SetAlphaTest(FALSE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
 }
@@ -655,6 +658,27 @@ static void run_store_depth(const ZwGx2Command *command) {
     run_fullscreen(program, &depth->texture);
 }
 
+/* what the batch drew into, whose GPU caches are written out before it ends,
+   so nothing of it lingers to land over pixels the CPU writes later */
+static uint8_t touched[MAX_OBJECTS];
+
+static void touch(uint32_t handle) {
+    if (handle && handle <= MAX_OBJECTS) touched[handle - 1] = 1;
+}
+
+static void flush_touched(void) {
+    for (uint32_t i = 0; i < MAX_OBJECTS; i++) {
+        if (!touched[i]) continue;
+        touched[i] = 0;
+        Object *o = &objects[i];
+        if (o->kind == OBJ_COLOR) {
+            GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, o->color.surface.image, o->color.surface.imageSize);
+        } else if (o->kind == OBJ_DEPTH) {
+            GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, o->depth.surface.image, o->depth.surface.imageSize);
+        }
+    }
+}
+
 static void run_batch(const ZwGx2Command *commands, uint32_t count, const uint32_t *readback, uint32_t readback_count) {
     GX2SetContextState(context);
     for (uint32_t i = 0; i < MAX_OBJECTS; i++) {
@@ -666,6 +690,12 @@ static void run_batch(const ZwGx2Command *commands, uint32_t count, const uint32
     }
     for (uint32_t i = 0; i < count; i++) {
         const ZwGx2Command *command = &commands[i];
+        if (command->kind == ZW_GX2_CMD_STORE_DEPTH) {
+            touch(command->color);
+        } else {
+            touch(command->color);
+            touch(command->depth);
+        }
         switch (command->kind) {
         case ZW_GX2_CMD_DRAW:
             run_draw(command);
@@ -697,12 +727,8 @@ static void run_batch(const ZwGx2Command *commands, uint32_t count, const uint32
             break;
         }
     }
-    for (uint32_t i = 0; i < readback_count; i++) {
-        Object *color = object(readback[i]);
-        if (color && color->kind == OBJ_COLOR) {
-            GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, color->color.surface.image, color->color.surface.imageSize);
-        }
-    }
+    for (uint32_t i = 0; i < readback_count; i++) touch(readback[i]);
+    flush_touched();
     GX2DrawDone();
     for (uint32_t i = 0; i < readback_count; i++) {
         Object *color = object(readback[i]);

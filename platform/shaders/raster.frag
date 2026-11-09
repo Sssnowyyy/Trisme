@@ -20,6 +20,8 @@ layout(location = 3) noperspective in float in_depth;
 layout(location = 4) in vec4 in_quaternion;
 // the view vector, and in w texture coordinate set 0's w
 layout(location = 5) in vec4 in_view;
+// 1/w, what GLSL gives as the w of gl_FragCoord, from raster.vert
+layout(location = 6) noperspective in float zw_inv_w;
 
 layout(location = 0) out vec4 out_color;
 
@@ -645,7 +647,7 @@ float fragment_depth() {
         depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);
     }
     if ((depth_mode & 1u) != 0u) {
-        depth /= gl_FragCoord.w;
+        depth /= zw_inv_w;
     }
     return clamp(depth, 0.0, 1.0);
 }

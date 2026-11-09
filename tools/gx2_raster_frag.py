@@ -78,6 +78,14 @@ while True:
 text = "".join(out)
 assert "tables[" not in text
 
+# gl_FragCoord.w is 1/w in GLSL, but Latte's position input carries w itself,
+# and whether the compiler turns it over is unverified: take 1/w from the
+# vertex shader instead, interpolated linearly on the screen as it is
+anchor = "layout(location = 5) in vec4 in_view;"
+assert text.count(anchor) == 1, "the inputs changed"
+text = text.replace(anchor, anchor + "\n// 1/w, what GLSL gives as the w of gl_FragCoord, from raster.vert\nlayout(location = 6) noperspective in float zw_inv_w;")
+text = text.replace("gl_FragCoord.w", "zw_inv_w")
+
 lines = text.split("\n")
 assert lines[0].startswith("#version")
 header = [

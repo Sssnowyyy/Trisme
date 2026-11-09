@@ -38,9 +38,11 @@
 /* sound held for the output, past which more is dropped: about 100 ms */
 #define AUDIO_MOST_QUEUED_MS 100
 #define TOAST_FRAMES 150
-/* the screens' pace when the GPU's work for the console is run between
-   frames: a 59.94 Hz frame */
-#define FRAME_US 16683
+/* when the GPU's work for the console runs between frames: from one
+   present to this long after it, leaving the rest of a 59.94 Hz frame for
+   drawing the screens. measured from the present, which returns at vsync
+   when it waits, so the window follows the display */
+#define SERVICE_US 14000
 
 static uint8_t top_pixels[ZW_TOP_WIDTH * ZW_SCREEN_HEIGHT * 4];
 static uint8_t bottom_pixels[ZW_BOTTOM_WIDTH * ZW_SCREEN_HEIGHT * 4];
@@ -486,7 +488,7 @@ int main(int argc, char **argv) {
     ZwLayoutPlan plan;
     int running = 1;
     int background = 0;
-    OSTime next_frame = 0;
+    OSTime presented = 0;
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -520,7 +522,7 @@ int main(int argc, char **argv) {
         if (background) {
             /* GX2 is the HOME menu's now: a batch the console submitted waits */
             SDL_Delay(10);
-            next_frame = 0;
+            presented = 0;
             continue;
         }
         zakuro_wiiu_heartbeat();
@@ -528,11 +530,12 @@ int main(int argc, char **argv) {
             /* until the next frame is due, run what the console asks of the
                GPU as soon as it asks, rather than once a frame */
             OSTime now = OSGetSystemTime();
-            OSTime period = (OSTime)OSMicrosecondsToTicks(FRAME_US);
-            next_frame = next_frame == 0 || next_frame + period < now ? now : next_frame + period;
-            while ((now = OSGetSystemTime()) < next_frame) {
-                zw_gx2_service((uint32_t)OSTicksToMicroseconds(next_frame - now));
+            OSTime until = presented ? presented + (OSTime)OSMicrosecondsToTicks(SERVICE_US) : now;
+            while ((now = OSGetSystemTime()) < until) {
+                zw_gx2_service((uint32_t)OSTicksToMicroseconds(until - now));
             }
+            /* one waiting batch at least, even when the frame ran late */
+            zw_gx2_service(0);
         }
 
         zw_layout_plan(layout, tv.width, tv.height, drc.width, drc.height, &plan);
@@ -570,6 +573,7 @@ int main(int argc, char **argv) {
         const char *shown = message[0] ? message : (started && zakuro_wiiu_state() == ZW_STATE_LOADING ? "Loading..." : NULL);
         draw(&drc, plan.drc_top, plan.drc_bottom, shown);
         draw(&tv, plan.tv_top, plan.tv_bottom, shown);
+        presented = OSGetSystemTime();
         if (toast_frames > 0) toast_frames--;
     }
 
