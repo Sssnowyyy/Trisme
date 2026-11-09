@@ -179,13 +179,13 @@ vec4 sample_unit(uint unit, vec2 uv) {
     return border_s || border_t ? unpack_color(units[unit].y) : sampled;
 }
 
-precise float lookup(uint table, uint entry, float delta) {
+float lookup(uint table, uint entry, float delta) {
     vec2 value = table_entry(table * 256u + entry);
     return value.x + value.y * delta;
 }
 
 // a procedural texture map read at a coordinate from 0 to 1
-precise float proctex_lookup(uint map, float coordinate) {
+float proctex_lookup(uint map, float coordinate) {
     float at = coordinate * 128.0;
     uint entry = min(uint(max(at, 0.0)), 127u);
     vec2 value = table_entry(PROCTEX_MAPS + map * 128u + entry);
@@ -223,7 +223,7 @@ float proctex_shift(float other, uint mode, uint clamping) {
     return 0.0;
 }
 
-precise float proctex_clamp(float c, uint mode) {
+float proctex_clamp(float c, uint mode) {
     switch (mode) {
         case 0u: return c > 1.0 ? 0.0 : c;
         case 1u: return min(c, 1.0);
@@ -238,7 +238,7 @@ precise float proctex_clamp(float c, uint mode) {
     }
 }
 
-precise float proctex_combine(float u, float v, uint function) {
+float proctex_combine(float u, float v, uint function) {
     float len = sqrt(u * u + v * v);
     switch (function) {
         case 0u: return u;
@@ -257,7 +257,7 @@ precise float proctex_combine(float u, float v, uint function) {
 
 // texture 3, made up from its coordinates, as the software rasterizer has
 // it. precise as the combiners are, as is lighting
-precise vec4 procedural(vec2 uv) {
+vec4 procedural(vec2 uv) {
     uint config = proctex[0].x;
     uvec2 clamps = uvec2(config & 7u, (config >> 3) & 7u);
     float u = abs(uv.x);
@@ -306,12 +306,12 @@ precise vec4 procedural(vec2 uv) {
     return color;
 }
 
-precise vec3 rotate(vec4 q, vec3 v) {
+vec3 rotate(vec4 q, vec3 v) {
     vec3 inner = cross(q.xyz, v);
     return v + 2.0 * cross(q.xyz, inner + v * q.w);
 }
 
-precise float quantize(float c) {
+float quantize(float c) {
     return floor(clamp(c, 0.0, 1.0) * 255.0) / 255.0;
 }
 
@@ -470,7 +470,7 @@ void shade(vec4 textures[4], out vec4 diffuse_out, out vec4 specular_out) {
     specular_out = vec4(quantize(specular_sum.r), quantize(specular_sum.g), quantize(specular_sum.b), quantize(specular_sum.a));
 }
 
-precise vec3 color_operand(vec4 s, uint operand) {
+vec3 color_operand(vec4 s, uint operand) {
     switch (operand) {
         case 0x1u: return vec3(1.0) - s.rgb;
         case 0x2u: return vec3(s.a);
@@ -485,7 +485,7 @@ precise vec3 color_operand(vec4 s, uint operand) {
     }
 }
 
-precise float alpha_operand(vec4 s, uint operand) {
+float alpha_operand(vec4 s, uint operand) {
     switch (operand) {
         case 0x0u: return s.a;
         case 0x1u: return 1.0 - s.a;

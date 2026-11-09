@@ -13,6 +13,8 @@ what changes for CafeGLSL, the offline GX2 compiler:
 - no descriptor sets.
 - the Tables storage buffer becomes a uniform block of vec4s holding the
   same bytes, two vec2 entries each, read through table_entry().
+- precise comes off function return types, which Mesa rejects.
+- the w-buffer reads 1/w from a varying instead of gl_FragCoord.w.
 """
 import re
 import sys
@@ -85,6 +87,12 @@ anchor = "layout(location = 5) in vec4 in_view;"
 assert text.count(anchor) == 1, "the inputs changed"
 text = text.replace(anchor, anchor + "\n// 1/w, what GLSL gives as the w of gl_FragCoord, from raster.vert\nlayout(location = 6) noperspective in float zw_inv_w;")
 text = text.replace("gl_FragCoord.w", "zw_inv_w")
+
+# Mesa, which CafeGLSL is built on, takes precise on variables but not on a
+# function's return type, which glslang allows: the functions' bodies keep
+# their precise variables
+text, count = re.subn(r"^precise (\w+ \w+\()", r"\1", text, flags=re.M)
+assert count > 0, "no precise functions left, check whether this is still needed"
 
 lines = text.split("\n")
 assert lines[0].startswith("#version")
