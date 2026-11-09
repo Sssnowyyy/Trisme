@@ -39,6 +39,8 @@ options:
   --seeddb <seeddb.bin>   seeds for titles that use seed encryption
   --rom-on-sd             leave the game out of the bundle; copy the .cxi it
                           writes to sd:/wiiu/zakuro/<title id>/game.cxi
+  --optimize <size|speed> compile the recompiled code for size (-Os, about a
+                          quarter smaller, the default) or speed (-O2)
   --interpreter           don't recompile, run everything in the interpreter
   --overrides <file|dir>  hand-written C replacing recompiled functions
   --kit <dir>             the prebuilt Zakuro Wii U kit (default: ./kit)
@@ -63,6 +65,7 @@ struct Options {
     work: Option<PathBuf>,
     keep: bool,
     new3ds: bool,
+    optimize_size: bool,
 }
 
 fn parse() -> Result<Options, String> {
@@ -82,6 +85,7 @@ fn parse() -> Result<Options, String> {
         work: None,
         keep: false,
         new3ds: false,
+        optimize_size: true,
     };
     let mut rom = None;
     while let Some(arg) = args.next() {
@@ -105,6 +109,13 @@ fn parse() -> Result<Options, String> {
                     "tv" | "1" => 1,
                     "gamepad" | "drc" | "2" => 2,
                     other => return Err(format!("unknown layout {other}, split, tv or gamepad")),
+                }
+            }
+            "--optimize" => {
+                options.optimize_size = match value(&arg)?.as_str() {
+                    "size" | "s" => true,
+                    "speed" | "2" => false,
+                    other => return Err(format!("unknown optimization {other}, size or speed")),
                 }
             }
             "--keys" => options.keys = Some(value(&arg)?.into()),
@@ -203,7 +214,7 @@ fn convert(options: &Options) -> Result<(), String> {
         None
     } else {
         step("recompiling the game's code (this takes a while)");
-        let info = recomp::recompile(&cxi_path, &code_dir, options.overrides.as_deref())?;
+        let info = recomp::recompile(&cxi_path, &code_dir, options.overrides.as_deref(), options.optimize_size)?;
         println!("    {}", info.summary);
         Some(info)
     };

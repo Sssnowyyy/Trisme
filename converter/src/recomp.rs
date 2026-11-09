@@ -31,7 +31,8 @@ pub struct Code {
 }
 
 /// the game's code as C, compiled for the Wii U into a static library.
-pub fn recompile(cxi: &Path, dir: &Path, overrides: Option<&Path>) -> Result<Code, String> {
+pub fn recompile(cxi: &Path, dir: &Path, overrides: Option<&Path>, size: bool) -> Result<Code, String> {
+    recomp3ds::wiiu::set_optimize_for_size(size);
     let info = recomp3ds::wiiu::write_wiiu_code(cxi, dir, overrides)?;
     Ok(Code {
         summary: format!(

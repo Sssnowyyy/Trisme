@@ -123,6 +123,19 @@ pub struct CodeInfo {
     pub took: Duration,
 }
 
+/// compile for size (-Os) rather than speed (-O2). recompiled code comes to
+/// some 20 bytes of PowerPC for each byte of ARM at -O2, and -Os takes a
+/// quarter off that, which a big game needs to fit the Wii U's code area.
+static OPTIMIZE_FOR_SIZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_optimize_for_size(size: bool) {
+    OPTIMIZE_FOR_SIZE.store(size, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn optimization() -> &'static [&'static str] {
+    if OPTIMIZE_FOR_SIZE.load(std::sync::atomic::Ordering::Relaxed) { &["-Os"] } else { &[] }
+}
+
 /// writes the title at rom as C in dir/code, the overrides with it, compiles
 /// it for the Wii U into dir/code/librecomp.a and writes dir/code/info.json.
 pub fn write_wiiu_code(rom: &Path, dir: &Path, overrides: Option<&Path>) -> Result<CodeInfo, String> {
@@ -148,6 +161,8 @@ pub fn write_wiiu_code_with(
     };
     let mut flags: Vec<&str> = compile::FLAGS.to_vec();
     flags.extend_from_slice(FLAGS);
+    // the last -O wins
+    flags.extend_from_slice(optimization());
     let objects = compile::objects_with(&tools.gcc, &code, &generated.sources, &flags, &progress, false)?;
     let library = code.join("librecomp.a");
     archive(&tools.ar, &code, &objects, &library)?;
@@ -315,6 +330,7 @@ void s32(uint8_t *at, uint32_t v) { store32(at, v); }
         let output = Command::new(&tools.gcc.program)
             .args(compile::FLAGS)
             .args(FLAGS)
+            .args(optimization())
             .args(["-S", "-o", "-", "t.c"])
             .current_dir(&dir)
             .output()
