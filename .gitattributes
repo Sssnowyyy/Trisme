@@ -1,0 +1,5 @@
+# shell scripts and makefiles must keep LF endings for bash/make on Windows checkouts
+*.sh text eol=lf
+Makefile text eol=lf
+*.frag text eol=lf
+*.vert text eol=lf

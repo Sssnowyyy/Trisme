@@ -11,6 +11,17 @@ use crate::lighting::{Lighting, Tables};
 
 #[cfg(feature = "vulkan")]
 pub(crate) mod hardware;
+#[cfg(feature = "gx2")]
+#[cfg_attr(feature = "vulkan", allow(dead_code))]
+pub(crate) mod gx2;
+#[cfg(hw_raster)]
+pub(crate) mod hw;
+/// the host GPU's rasterizer this build draws with, Vulkan's when it has
+/// it, else the Wii U's.
+#[cfg(feature = "vulkan")]
+pub(crate) use hardware::Hardware as Backend;
+#[cfg(all(feature = "gx2", not(feature = "vulkan")))]
+pub(crate) use gx2::Hardware as Backend;
 use crate::texture::TextureFormat;
 use crate::shader::{self, ShaderUnit, Vec4};
 use crate::{format::ColorFormat, GpuMemory};
@@ -862,7 +873,7 @@ pub(crate) fn same_bits(a: &[Vec4], b: &[Vec4]) -> bool {
 
 /// whether draws hand their vertex work to other threads, see Gpu::scout,
 /// unless ZAKURO_SHADE_AHEAD is 0.
-#[cfg(feature = "vulkan")]
+#[cfg(hw_raster)]
 fn shading_ahead() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ZAKURO_SHADE_AHEAD").map_or(true, |value| value != "0"))
@@ -1412,6 +1423,7 @@ struct BoundTexture {
     /// the texture decoded, row by row from the top, none when it is drawn
     /// unless it reaches past the rows drawn. its smaller sizes follow.
     texels: Arc<[[u8; 4]]>,
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     drawn: Option<DrawnTexture>,
     /// bilinear rather than point sampling when magnifying.
     linear: bool,
@@ -1422,6 +1434,7 @@ struct BoundTexture {
     border: [f32; 4],
     /// the texture pack's picture for it, which the host's GPU draws with
     /// in its place once it has been read.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     replacement: Option<Arc<crate::pack::Material>>,
     /// how many sizes the texels hold, each half the last.
     levels: u32,
@@ -1529,6 +1542,7 @@ pub struct Resources {
     pub(crate) words: Vec<u32>,
     /// the last draw's triangles as the GPU takes them, the next one's
     /// buffer.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     triangles: Vec<u32>,
     /// the last draw's texture environment and lighting, which the next
     /// mostly keeps.
@@ -1538,17 +1552,17 @@ pub struct Resources {
     #[cfg(feature = "vulkan")]
     semantics: LastSemantics,
     /// the host GPU, when draws go to it rather than to the software path.
-    #[cfg(feature = "vulkan")]
-    pub(crate) hardware: Option<hardware::Hardware>,
+    #[cfg(hw_raster)]
+    pub(crate) hardware: Option<Backend>,
 }
 
 impl Resources {
     /// whether draws hand their vertex work to other threads, see
     /// Gpu::scout: on the host's GPU while the CPU shades.
     pub(crate) fn hands_out(&self) -> bool {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         return shading_ahead() && self.hardware.as_ref().is_some_and(|hardware| !hardware.shades());
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         false
     }
 
@@ -1562,26 +1576,27 @@ impl Resources {
         #[cfg(feature = "vulkan")]
         {
             self.semantics = Default::default();
-            if let Some(hardware) = self.hardware.as_mut() {
-                hardware.forget();
-            }
+        }
+        #[cfg(hw_raster)]
+        if let Some(hardware) = self.hardware.as_mut() {
+            hardware.forget();
         }
     }
 
     /// what the next draws do for frame interpolation.
     pub(crate) fn set_pass(&mut self, pass: Pass) {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.hardware.as_mut() {
             hardware.pass = pass;
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = pass;
     }
 
     /// whether draws go into twins, frame interpolation drawing the
     /// pictures in between.
     pub(crate) fn twins(&self) -> bool {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.hardware.as_ref() {
             return hardware.twins();
         }
@@ -1607,6 +1622,7 @@ struct Scratch {
     order: Vec<usize>,
     inputs: Vec<[Vec4; shader::INPUT_REGISTERS]>,
     /// each vertex of a draw counted from the first one it uses.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     relative: Vec<u32>,
     plans: Plans,
     /// the arrays a draw hands the GPU to decode.
@@ -2059,7 +2075,7 @@ fn bind_texture<M: GpuMemory>(
 
 /// a texture unit's texture as rows of a color buffer, when it is on and in
 /// a format a color buffer has.
-#[cfg(feature = "vulkan")]
+#[cfg(hw_raster)]
 fn drawn_texture<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Option<DrawnTexture> {
     use crate::texture::TextureFormat;
     if registers[REG_TEXTURE_CONFIG] & (1 << unit) == 0 {
@@ -2082,7 +2098,7 @@ fn drawn_texture<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Op
 }
 
 /// the guest memory a texture unit reads, when it is on.
-#[cfg(feature = "vulkan")]
+#[cfg(hw_raster)]
 fn texture_range<M: GpuMemory>(registers: &[u32], memory: &M, unit: usize) -> Option<(u32, u32)> {
     if registers[REG_TEXTURE_CONFIG] & (1 << unit) == 0 {
         return None;
@@ -2464,12 +2480,12 @@ struct DrawState<'a> {
     fog_table: &'a crate::fog::Table,
 }
 
-#[cfg(feature = "vulkan")]
+#[cfg(hw_raster)]
 impl DrawState<'_> {
     /// the draw as the GPU takes it.
-    fn hardware<'a>(&'a self, registers: &'a [u32], geometry: hardware::Geometry<'a>) -> hardware::Draw<'a> {
+    fn hardware<'a>(&'a self, registers: &'a [u32], geometry: hw::Geometry<'a>) -> hw::Draw<'a> {
         let target = &self.target;
-        hardware::Draw {
+        hw::Draw {
             registers,
             target: target.addr,
             format: target.format,
@@ -3050,6 +3066,7 @@ fn raw_inputs<M: GpuMemory>(
 
 /// the vertices of each triangle out of count of them, as assemble puts
 /// them, each the vertex it names, into indices.
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
 fn assemble_into(topology: u32, count: usize, vertex: impl Fn(usize) -> u32, indices: &mut Vec<u32>) {
     indices.clear();
     // a strip or a fan a triangle at a time, a flattened iterator has no
@@ -3164,7 +3181,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     // the rest of one reaching past the rows drawn is read as memory holds
     // it, as of what was written back last
     let mut past = [false; 3];
-    #[cfg(feature = "vulkan")]
+    #[cfg(hw_raster)]
     if let Some(hardware) = resources.hardware.as_mut() {
         for (unit, drawn) in drawn.iter_mut().enumerate() {
             // one memory holds as drawn is still the GPU's to copy, unless
@@ -3256,7 +3273,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
                 viewport,
                 cull: cull_mode,
             };
-            let drawn = hardware.draw(memory, &state.hardware(registers, hardware::Geometry::Shaded(&shading)));
+            let drawn = hardware.draw(memory, &state.hardware(registers, hw::Geometry::Shaded(&shading)));
             let triangles = (indices.len() / 3) as u32;
             resources.triangles = assembled;
             match drawn {
@@ -3267,7 +3284,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     }
     let (processed, placed_here);
     // the order goes to the software path the GPU falls back on alone
-    #[cfg_attr(not(feature = "vulkan"), allow(unused_variables))]
+    #[cfg_attr(not(hw_raster), allow(unused_variables))]
     let (shaded, order, placement) = match vertices {
         Vertices::Prepared(prepared) => (&prepared.shaded[..], prepared.order.as_deref(), &prepared.placement),
         Vertices::Shaded(shaded) => {
@@ -3287,12 +3304,12 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
     let (triangle_count, clipped_away, culled) = (placement.triangles, placement.clipped_away, placement.culled);
     let mut stats = FillStats::default();
 
-    #[cfg(feature = "vulkan")]
+    #[cfg(hw_raster)]
     if let Some(hardware) = resources.hardware.as_mut() {
         let target = &state.target;
         // tiles are whole in any buffer a title really draws into
         if target.buffer_width.is_multiple_of(8) && target.buffer_height.is_multiple_of(8) {
-            let geometry = hardware::Geometry::Placed { vertices: placed, indices };
+            let geometry = hw::Geometry::Placed { vertices: placed, indices };
             match hardware.draw(memory, &state.hardware(registers, geometry)) {
                 Ok(()) => return Some(triangle_count as u32),
                 Err(error) => log::error!("the GPU could not draw, {error}, drawing in software"),
@@ -4484,7 +4501,7 @@ mod tests {
         let texture = |height| DrawnTexture { addr: COLOR, width: 8, height, format: ColorFormat::Rgba8 };
         assert!(hardware.holds(&texture(8)));
         assert!(!hardware.holds(&texture(16)));
-        let transfer = hardware::Transfer {
+        let transfer = hw::Transfer {
             input: COLOR,
             output: OUTPUT,
             input_width: 8,
@@ -4530,7 +4547,7 @@ mod tests {
             assert!(!hardware.holds(&texture), "the texture comes from memory");
             // the rest of the drawing comes down, and the buffer is used again
             hardware.sync(&mut memory, COLOR + 256, 256).unwrap();
-            let transfer = hardware::Transfer {
+            let transfer = hw::Transfer {
                 input: COLOR,
                 output: OUTPUT,
                 input_width: 8,
@@ -4647,7 +4664,7 @@ mod tests {
         resources.hardware.as_mut().unwrap().filled(COLOR, &fill).unwrap();
         rasterize_shaded(&narrow, &mut memory, &mut resources, &cover(-0.5, GREEN));
         let hardware = resources.hardware.as_mut().unwrap();
-        let transfer = hardware::Transfer {
+        let transfer = hw::Transfer {
             input: COLOR,
             output: OUTPUT,
             input_width: 16,
@@ -4828,7 +4845,7 @@ mod tests {
         let mut resources = Resources { hardware: Some(hardware), ..Default::default() };
         rasterize_shaded(&registers, &mut memory, &mut resources, &cover(-0.5, RED));
         let hardware = resources.hardware.as_mut().unwrap();
-        let transfer = |input: u32, output: u32| hardware::Transfer {
+        let transfer = |input: u32, output: u32| hw::Transfer {
             input,
             output,
             input_width: 8,
@@ -4858,7 +4875,7 @@ mod tests {
     fn transferred(memory: &mut ConsoleMemory, resources: &mut Resources, rows: u32) -> Vec<[u8; 4]> {
         const OUTPUT: u32 = 0x10_0000;
         let hardware = resources.hardware.as_mut().unwrap();
-        let transfer = hardware::Transfer {
+        let transfer = hw::Transfer {
             input: COLOR,
             output: OUTPUT,
             input_width: 8,
@@ -6183,7 +6200,7 @@ mod tests {
                     let input = COLOR + tile_rows * 8 * SIZE * input_format.bytes_per_pixel() as u32;
                     let input_height = SIZE - tile_rows * 8;
                     let (width, height) = (SIZE / scale_x, input_height / scale_y);
-                    let transfer = hardware::Transfer {
+                    let transfer = hw::Transfer {
                         input,
                         output: OUTPUT,
                         input_width: SIZE,
@@ -6344,7 +6361,7 @@ mod tests {
                     let (mut gpu, mut cpu) = (drawn.clone(), drawn.clone());
                     let (scale_x, scale_y) = [(1, 1), (2, 1), (2, 2)][downscale as usize];
                     let (width, height) = (SIZE / scale_x, SIZE / scale_y);
-                    let to_linear = hardware::Transfer {
+                    let to_linear = hw::Transfer {
                         input: COLOR,
                         output: LINEAR,
                         input_width: SIZE,
@@ -6358,7 +6375,7 @@ mod tests {
                         input_format: Rgba8,
                         output_format: linear_format,
                     };
-                    let back = hardware::Transfer {
+                    let back = hw::Transfer {
                         input: LINEAR,
                         output: OUTPUT,
                         output_width: width,
@@ -6393,7 +6410,7 @@ mod tests {
         }
         // nothing the GPU holds there
         let hardware = resources.hardware.as_mut().unwrap();
-        let elsewhere = hardware::Transfer {
+        let elsewhere = hw::Transfer {
             input: 0x0C_0000,
             output: OUTPUT,
             input_width: SIZE,
@@ -6409,7 +6426,7 @@ mod tests {
         };
         assert!(!hardware.display_transfer(&mut drawn.clone(), &elsewhere).unwrap());
         // an output of part of a tile is the CPU's too
-        let partial = hardware::Transfer { input: LINEAR, output_height: SIZE - 4, copy: (SIZE, SIZE - 4), ..elsewhere };
+        let partial = hw::Transfer { input: LINEAR, output_height: SIZE - 4, copy: (SIZE, SIZE - 4), ..elsewhere };
         assert!(!hardware.display_transfer(&mut drawn.clone(), &partial).unwrap());
     }
 
@@ -6452,7 +6469,7 @@ mod tests {
             memory.write(LINEAR, &pattern);
             hardware.filled(LINEAR, &pattern).unwrap();
         };
-        let to_linear = hardware::Transfer {
+        let to_linear = hw::Transfer {
             input: COLOR,
             output: LINEAR,
             input_width: SIZE,
@@ -6466,7 +6483,7 @@ mod tests {
             input_format: Rgba8,
             output_format: Rgb565,
         };
-        let back = hardware::Transfer { input: LINEAR, output: OUTPUT, input_linear: true, output_tiled: true, input_format: Rgb565, ..to_linear };
+        let back = hw::Transfer { input: LINEAR, output: OUTPUT, input_linear: true, output_tiled: true, input_format: Rgb565, ..to_linear };
         fill(hardware, &mut gpu);
         assert!(hardware.display_transfer(&mut gpu, &to_linear).unwrap());
         fill(hardware, &mut gpu);
@@ -6526,7 +6543,7 @@ mod tests {
                     rasterize_shaded(&registers, &mut memory, &mut resources, &triangle);
                 }
                 let hardware = resources.hardware.as_mut().unwrap();
-                let transfer = hardware::Transfer {
+                let transfer = hw::Transfer {
                     input: COLOR,
                     output: OUTPUT,
                     input_width: SIZE,
@@ -6590,7 +6607,7 @@ mod tests {
         registers[REG_VIEWPORT_WIDTH] = float24(SIZE as f32 / 2.0);
         registers[REG_VIEWPORT_HEIGHT] = float24(SIZE as f32 / 2.0);
         registers[REG_FRAMEBUFFER_DIMENSIONS] = SIZE | ((SIZE - 1) << 12) | 1 << 24;
-        let transfer = hardware::Transfer {
+        let transfer = hw::Transfer {
             input: COLOR,
             output: OUTPUT,
             input_width: SIZE,

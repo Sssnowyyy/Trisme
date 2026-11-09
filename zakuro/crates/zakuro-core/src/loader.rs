@@ -215,6 +215,18 @@ pub fn load(path: impl AsRef<std::path::Path>, mut config: Config) -> Result<Sys
             Err(error) => log::warn!("{error}, drawing in software"),
         }
     }
+    #[cfg(not(feature = "gx2"))]
+    if system.config.gx2_renderer {
+        log::warn!("this build has no GX2 renderer, drawing in software");
+    }
+    // the vertices stay on the CPU, and texture packs with the software path
+    #[cfg(feature = "gx2")]
+    if system.config.gx2_renderer && !on_gpu {
+        match system.gpu.enable_gx2_renderer() {
+            Ok(name) => log::info!("drawing on {name}"),
+            Err(error) => log::warn!("{error}, drawing in software"),
+        }
+    }
     if system.config.interpolate {
         match system.set_interpolation(true) {
             true => log::info!("frame interpolation on"),

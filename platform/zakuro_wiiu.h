@@ -72,7 +72,9 @@ typedef struct ZwParams {
     uint8_t language;
     /* 0 Japan, 1 USA, 2 Europe, 0xFF the default */
     uint8_t region;
-    uint8_t pad_;
+    /* 0 draws the 3D on the CPU, 1 on the GPU through GX2 when
+       zw_gx2_available(), see zw_gx2.h */
+    uint8_t renderer;
     /* the CPU core the console runs on, 0..2, or -1 for any */
     int32_t emu_core;
 } ZwParams;

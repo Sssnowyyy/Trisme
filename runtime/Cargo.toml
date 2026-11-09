@@ -12,7 +12,9 @@ crate-type = ["staticlib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]
-zakuro-core = { path = "../zakuro/crates/zakuro-core", default-features = false }
+# gx2: the 3D on the Wii U's GPU when the platform layer offers it, see
+# ZwParams::renderer
+zakuro-core = { path = "../zakuro/crates/zakuro-core", default-features = false, features = ["gx2"] }
 zakuro-common = { path = "../zakuro/crates/zakuro-common" }
 zakuro-fs = { path = "../zakuro/crates/zakuro-fs" }
 log = "0.4"

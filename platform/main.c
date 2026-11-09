@@ -28,6 +28,7 @@
 #include "game_info.h"
 #include "layout.h"
 #include "zakuro_wiiu.h"
+#include "zw_gx2.h"
 
 #define SD_ROOT "fs:/vol/external01/wiiu/zakuro"
 #define CONTENT_ROOT "fs:/vol/content"
@@ -37,6 +38,9 @@
 /* sound held for the output, past which more is dropped: about 100 ms */
 #define AUDIO_MOST_QUEUED_MS 100
 #define TOAST_FRAMES 150
+/* the screens' pace when the GPU's work for the console is run between
+   frames: a 59.94 Hz frame */
+#define FRAME_US 16683
 
 static uint8_t top_pixels[ZW_TOP_WIDTH * ZW_SCREEN_HEIGHT * 4];
 static uint8_t bottom_pixels[ZW_BOTTOM_WIDTH * ZW_SCREEN_HEIGHT * 4];
@@ -50,6 +54,9 @@ typedef struct Display {
 
 static Display tv, drc;
 static int layout = ZW_LAYOUT_SPLIT;
+/* where the 3D is drawn: 1 the GPU through GX2 when the program has the
+   shaders, 0 the CPU */
+static int renderer = 1;
 static char settings_path[256];
 static char toast[96];
 static int toast_frames;
@@ -93,6 +100,7 @@ static void mkdirs(const char *path) {
 
 static void load_settings(void) {
     layout = zw_game_default_layout;
+    renderer = zw_game_renderer ? 1 : 0;
     FILE *file = fopen(settings_path, "r");
     if (!file) return;
     char line[128];
@@ -100,6 +108,8 @@ static void load_settings(void) {
         int value;
         if (sscanf(line, "layout=%d", &value) == 1 && value >= 0 && value < ZW_LAYOUT_COUNT) {
             layout = value;
+        } else if (sscanf(line, "renderer=%d", &value) == 1 && (value == 0 || value == 1)) {
+            renderer = value;
         }
     }
     fclose(file);
@@ -111,8 +121,10 @@ static void save_settings(void) {
         WHBLogPrintf("could not write %s (%d)", settings_path, errno);
         return;
     }
-    fprintf(file, "# Zakuro for Wii U, %s\n# layout: 0 top on TV + bottom on GamePad, 1 both on TV, 2 both on GamePad\nlayout=%d\n",
-            zw_game_title, layout);
+    fprintf(file,
+            "# Zakuro for Wii U, %s\n# layout: 0 top on TV + bottom on GamePad, 1 both on TV, 2 both on GamePad\nlayout=%d\n"
+            "# renderer: 1 draws the 3D on the GPU (GX2), 0 on the CPU; read at start\nrenderer=%d\n",
+            zw_game_title, layout, renderer);
     fclose(file);
 }
 
@@ -438,6 +450,9 @@ int main(int argc, char **argv) {
         SDL_Quit();
         return 1;
     }
+    /* the GPU's work for the console runs on this thread, GX2's, between
+       SDL's frames */
+    int gx2 = renderer == 1 && zw_gx2_init();
     open_audio();
     KPADInit();
     WPADEnableURCC(TRUE);
@@ -459,6 +474,7 @@ int main(int argc, char **argv) {
            gets core 2 to itself, the GPU's software rasterizer threads go
            wherever */
         params.emu_core = 2;
+        params.renderer = gx2 ? 1 : 0;
         if (zakuro_wiiu_start(&params) == 0) {
             started = 1;
         } else {
@@ -470,6 +486,7 @@ int main(int argc, char **argv) {
     ZwLayoutPlan plan;
     int running = 1;
     int background = 0;
+    OSTime next_frame = 0;
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -501,10 +518,22 @@ int main(int argc, char **argv) {
             if (!background) reset_audio();
         }
         if (background) {
+            /* GX2 is the HOME menu's now: a batch the console submitted waits */
             SDL_Delay(10);
+            next_frame = 0;
             continue;
         }
         zakuro_wiiu_heartbeat();
+        if (gx2) {
+            /* until the next frame is due, run what the console asks of the
+               GPU as soon as it asks, rather than once a frame */
+            OSTime now = OSGetSystemTime();
+            OSTime period = (OSTime)OSMicrosecondsToTicks(FRAME_US);
+            next_frame = next_frame == 0 || next_frame + period < now ? now : next_frame + period;
+            while ((now = OSGetSystemTime()) < next_frame) {
+                zw_gx2_service((uint32_t)OSTicksToMicroseconds(next_frame - now));
+            }
+        }
 
         zw_layout_plan(layout, tv.width, tv.height, drc.width, drc.height, &plan);
         ZwInput input;
@@ -545,6 +574,8 @@ int main(int argc, char **argv) {
     }
 
     WHBLogPrint("closing");
+    /* a batch the console waits on is dropped, so its thread can stop */
+    zw_gx2_shutdown();
     if (started) zakuro_wiiu_stop();
     if (audio) SDL_CloseAudioDevice(audio);
     KPADShutdown();

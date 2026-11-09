@@ -17,7 +17,6 @@ mod toolchain;
 mod wup;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 use toolchain::{run, Kit, Toolchain};
@@ -35,6 +34,10 @@ options:
                           split   top screen on the TV, bottom on the GamePad
                           tv      both screens on the TV
                           gamepad both screens on the GamePad
+  --renderer <gpu|cpu>    where the 3D is drawn by default: gpu, GX2 on the
+                          Wii U's GPU (the default, needs a kit built with
+                          CafeGLSL), or cpu, Zakuro's software rasterizer.
+                          the player can change it in wiiu.cfg
   --keys <aes_keys.txt>   keys for an encrypted game, from your own console
   --seeddb <seeddb.bin>   seeds for titles that use seed encryption
   --rom-on-sd             leave the game out of the bundle; copy the .cxi it
@@ -57,6 +60,7 @@ struct Options {
     output: Option<PathBuf>,
     wup: bool,
     layout: i32,
+    renderer: u8,
     keys: Option<PathBuf>,
     seeddb: Option<PathBuf>,
     rom_on_sd: bool,
@@ -78,6 +82,7 @@ fn parse() -> Result<Options, String> {
         output: None,
         wup: false,
         layout: 0,
+        renderer: 1,
         keys: None,
         seeddb: None,
         rom_on_sd: false,
@@ -113,6 +118,13 @@ fn parse() -> Result<Options, String> {
                     "tv" | "1" => 1,
                     "gamepad" | "drc" | "2" => 2,
                     other => return Err(format!("unknown layout {other}, split, tv or gamepad")),
+                }
+            }
+            "--renderer" => {
+                options.renderer = match value(&arg)?.as_str() {
+                    "gpu" | "gx2" | "1" => 1,
+                    "cpu" | "software" | "0" => 0,
+                    other => return Err(format!("unknown renderer {other}, gpu or cpu")),
                 }
             }
             "--optimize" => {
@@ -232,21 +244,24 @@ fn convert(options: &Options) -> Result<(), String> {
         .replace("@TITLE@", &c_string(&short_name))
         .replace("@LAYOUT@", &options.layout.to_string())
         .replace("@ROM_NAME@", &c_string("game.cxi"))
+        .replace("@RENDERER@", &options.renderer.to_string())
         .replace("@NEW3DS@", if options.new3ds || cxi.new3ds_only { "1" } else { "0" })
         .replace("@HAS_CODE@", if code.is_some() { "1" } else { "0" });
     let game_info_c = work.join("game_info.c");
     std::fs::write(&game_info_c, game_info).map_err(|e| format!("could not write {}, {e}", game_info_c.display()))?;
     let game_info_o = work.join("game_info.o");
     run(
-        Command::new(&toolchain.gcc).args(toolchain.cflags()).arg(format!("-I{}", kit.include().display())).arg("-c").arg(&game_info_c).arg("-o").arg(&game_info_o),
+        toolchain.command(&toolchain.gcc).args(toolchain.cflags()).arg(format!("-I{}", kit.include().display())).arg("-c").arg(&game_info_c).arg("-o").arg(&game_info_o),
         "compiling game_info.c",
     )?;
 
     let elf = work.join("game.elf");
-    let mut link = Command::new(&toolchain.gcc);
-    link.arg(format!("-specs={}", toolchain.wut.join("share/wut.specs").display()))
+    let mut link = toolchain.command(&toolchain.gcc);
+    // -Xlinker and not -Wl, which would split a path with a comma in it
+    link.arg(format!("-specs={}", toolchain.wut.join("share").join("wut.specs").display()))
         .args(["-mcpu=750", "-meabi", "-mhard-float"])
-        .arg(format!("-Wl,-Map,{}", work.join("game.map").display()))
+        .args(["-Xlinker", "-Map", "-Xlinker"])
+        .arg(work.join("game.map"))
         .args(kit.objects())
         .arg(&game_info_o)
         .arg("-Wl,--start-group");
@@ -264,9 +279,9 @@ fn convert(options: &Options) -> Result<(), String> {
 
     // the Rust objects carry a .note.GNU-stack section elf2rpl can't place
     let stripped = work.join("game.stripped.elf");
-    run(Command::new(&toolchain.objcopy).args(["-R", ".note.GNU-stack", "-R", ".comment"]).arg(&elf).arg(&stripped), "objcopy")?;
+    run(toolchain.command(&toolchain.objcopy).args(["-R", ".note.GNU-stack", "-R", ".comment"]).arg(&elf).arg(&stripped), "objcopy")?;
     let rpx = work.join(format!("{}.rpx", file_name(&short_name)));
-    run(Command::new(&toolchain.elf2rpl).arg(&stripped).arg(&rpx), "elf2rpl")?;
+    run(toolchain.command(&toolchain.elf2rpl).arg(&stripped).arg(&rpx), "elf2rpl")?;
     let code_size = text_size(&toolchain, &stripped).unwrap_or(0);
     println!("    {} ({:.1} MiB, {:.1} MiB of code)", rpx.display(), file_mib(&rpx), code_size as f64 / (1 << 20) as f64);
     check_code_size(code_size, options)?;
@@ -316,7 +331,7 @@ fn convert(options: &Options) -> Result<(), String> {
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("could not create {}, {e}", parent.display()))?;
         }
-        let mut pack = Command::new(&toolchain.wuhbtool);
+        let mut pack = toolchain.command(&toolchain.wuhbtool);
         pack.arg(&rpx).arg(&output);
         // wuhbtool wants a content folder; an empty one when the game is on the SD card
         pack.arg(format!("--content={}", content.display()));
@@ -333,7 +348,11 @@ fn convert(options: &Options) -> Result<(), String> {
 
     std::mem::forget(guard);
     if !options.keep {
-        std::fs::remove_dir_all(&work).map_err(|e| format!("could not clean up {}, {e}", work.display()))?;
+        // the output is written by now, so a folder that won't go is only
+        // worth a warning
+        if let Err(e) = remove_dir(&work) {
+            println!("    warning: could not clean up {}, {e}", work.display());
+        }
     } else {
         println!("    intermediate files kept in {}", work.display());
     }
@@ -348,7 +367,23 @@ struct WorkGuard {
 impl Drop for WorkGuard {
     fn drop(&mut self) {
         if let Some(dir) = &self.dir {
-            let _ = std::fs::remove_dir_all(dir);
+            let _ = remove_dir(dir);
+        }
+    }
+}
+
+/// removes a folder and what is in it, trying again for a while: on Windows
+/// a virus scanner or the indexer may still have a file just written open.
+fn remove_dir(dir: &Path) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound && tries < 10 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            result => return result,
         }
     }
 }
@@ -405,8 +440,7 @@ fn check_code_size(code: u64, options: &Options) -> Result<(), String> {
 
 /// the size of the program's .text, from objdump's headers.
 fn text_size(toolchain: &Toolchain, elf: &Path) -> Option<u64> {
-    let objdump = toolchain.gcc.with_file_name(if cfg!(windows) { "powerpc-eabi-objdump.exe" } else { "powerpc-eabi-objdump" });
-    let output = Command::new(objdump).arg("-h").arg(elf).output().ok()?;
+    let output = toolchain.command(&toolchain.objdump).arg("-h").arg(elf).output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     let lines: Vec<&str> = text.lines().collect();
     let mut total = 0u64;

@@ -22,6 +22,9 @@ extern const int32_t zw_game_default_layout;
 /* the file name of the game in the bundle's content, e.g. "game.cxi" */
 extern const char zw_game_rom_name[];
 extern const uint8_t zw_game_new3ds;
+/* where the 3D is drawn until wiiu.cfg says otherwise: 1 the GPU (GX2),
+   0 the CPU */
+extern const uint8_t zw_game_renderer;
 
 /* fills code with the recomp_ symbols of the code linked in, or marks it
    absent for an interpreter-only build. */

@@ -30,14 +30,22 @@ The compiler is the first of these that runs:
 
 1. `WIIU_CC`
 2. `$DEVKITPPC/bin/powerpc-eabi-gcc`
-3. `$DEVKITPRO/devkitPPC/bin/powerpc-eabi-gcc`
-4. `/opt/devkitpro/devkitPPC/bin/powerpc-eabi-gcc`
-5. `powerpc-eabi-gcc` on the `PATH`
+3. `$DEVKITPRO/devkitPPC/bin/powerpc-eabi-gcc`, with `DEVKITPRO` defaulting
+   to `/opt/devkitpro`
+4. `powerpc-eabi-gcc` on the `PATH`
 
 `ar` and `nm` are taken from the same directory as the compiler, or else
-`powerpc-eabi-ar` and `powerpc-eabi-nm` from the `PATH`. Files are compiled
+`powerpc-eabi-ar` and `powerpc-eabi-nm` from the `PATH`. On Windows the
+programs end in `.exe`, and devkitPro's installer sets `DEVKITPRO` to the
+MSYS2 path `/opt/devkitpro`, which a native Windows program can't open.
+`wiiu::devkitpro()` and `wiiu::devkitppc()` turn such a path into a Windows
+one: what `cygpath -m` says when it runs (in MSYS2's shell), else the mounts
+in the `etc/fstab` of `C:\devkitPro\msys2` or `C:\msys64`, else
+`C:\devkitPro`. A Windows path in `DEVKITPRO` (`C:\devkitPro`) is used as it
+is. Files are compiled
 in parallel, the same way the host build does it. They are then archived
-with `ar rcs`, 256 objects per call. Finally `nm` checks that the archive
+with `ar rcs`, at most 256 objects and 16 KiB of names per call, which keeps
+each command line well inside Windows' 32767 characters. Finally `nm` checks that the archive
 defines the symbols below.
 
 ## Flags

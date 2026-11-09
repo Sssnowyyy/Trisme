@@ -8,6 +8,9 @@ license.workspace = true
 default = ["jit"]
 opengl = ["dep:glow"]
 vulkan = ["dep:ash", "dep:ash-window", "dep:naga"]
+# the Wii U's GPU through GX2, by way of the platform layer's functions in
+# platform/zw_gx2.h, which the program links in. the vertices stay on the CPU
+gx2 = []
 # the shaders the CPU runs compiled to the host's code instead of interpreted
 jit = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native"]
 
@@ -37,3 +40,8 @@ cranelift-frontend = { version = "0.135", optional = true }
 cranelift-jit = { version = "0.135", optional = true }
 cranelift-module = { version = "0.135", optional = true }
 cranelift-native = { version = "0.135", optional = true }
+
+[lints.rust]
+# hw_raster: build.rs sets it when a host GPU rasterizer is in, Vulkan's or
+# GX2's. the Wii U target's vendor, which the GX2 calls are gated on
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hw_raster)', 'cfg(target_vendor, values("wiiu"))'] }

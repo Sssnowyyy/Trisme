@@ -5,8 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub struct Toolchain {
+    /// devkitPro's and devkitPPC's folders, as this program opens them
+    pub devkitpro: PathBuf,
+    pub devkitppc: PathBuf,
     pub gcc: PathBuf,
     pub objcopy: PathBuf,
+    pub objdump: PathBuf,
     pub elf2rpl: PathBuf,
     pub wuhbtool: PathBuf,
     pub wut: PathBuf,
@@ -20,11 +24,11 @@ pub struct Kit {
 
 impl Kit {
     pub fn runtime(&self) -> PathBuf {
-        self.dir.join("lib/libzakuro_wiiu.a")
+        self.dir.join("lib").join("libzakuro_wiiu.a")
     }
 
     pub fn objects(&self) -> Vec<PathBuf> {
-        ["main.o", "layout.o", "newlib_shims.o"].iter().map(|name| self.dir.join("obj").join(name)).collect()
+        ["main.o", "layout.o", "newlib_shims.o", "gx2.o", "gx2_shaders.o"].iter().map(|name| self.dir.join("obj").join(name)).collect()
     }
 
     pub fn include(&self) -> PathBuf {
@@ -32,7 +36,7 @@ impl Kit {
     }
 
     pub fn game_info_template(&self) -> PathBuf {
-        self.dir.join("share/game_info_template.c")
+        self.dir.join("share").join("game_info_template.c")
     }
 
     /// finds the kit: the given folder, $ZAKURO_WIIU_KIT, or kit/ beside or
@@ -65,36 +69,60 @@ impl Kit {
 }
 
 impl Toolchain {
+    /// devkitPro from DEVKITPRO (and DEVKITPPC), or its usual place. on
+    /// Windows the installer sets DEVKITPRO to its MSYS2 path,
+    /// /opt/devkitpro, which recomp3ds::wiiu::devkitpro turns into the
+    /// Windows folder (C:\devkitPro), whether this runs from MSYS2's shell
+    /// or from cmd or PowerShell.
     pub fn find() -> Result<Toolchain, String> {
-        let devkitpro = std::env::var_os("DEVKITPRO").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/opt/devkitpro"));
-        let devkitppc = std::env::var_os("DEVKITPPC").map(PathBuf::from).unwrap_or_else(|| devkitpro.join("devkitPPC"));
-        let exe = if cfg!(windows) { ".exe" } else { "" };
+        let devkitpro = recomp3ds::wiiu::devkitpro();
+        let devkitppc = recomp3ds::wiiu::devkitppc();
+        let tool = |dir: &Path, name: &str| dir.join("bin").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         let toolchain = Toolchain {
-            gcc: devkitppc.join(format!("bin/powerpc-eabi-gcc{exe}")),
-            objcopy: devkitppc.join(format!("bin/powerpc-eabi-objcopy{exe}")),
-            elf2rpl: devkitpro.join(format!("tools/bin/elf2rpl{exe}")),
-            wuhbtool: devkitpro.join(format!("tools/bin/wuhbtool{exe}")),
+            gcc: tool(&devkitppc, "powerpc-eabi-gcc"),
+            objcopy: tool(&devkitppc, "powerpc-eabi-objcopy"),
+            objdump: tool(&devkitppc, "powerpc-eabi-objdump"),
+            elf2rpl: tool(&devkitpro.join("tools"), "elf2rpl"),
+            wuhbtool: tool(&devkitpro.join("tools"), "wuhbtool"),
             wut: devkitpro.join("wut"),
-            portlibs: devkitpro.join("portlibs/wiiu"),
+            portlibs: devkitpro.join("portlibs").join("wiiu"),
+            devkitpro,
+            devkitppc,
         };
+        // devkitPro's pacman is pacman in its MSYS2 on Windows
+        let pacman = if cfg!(windows) { "pacman" } else { "dkp-pacman" };
         let needed = [
-            (&toolchain.gcc, "devkitPPC (pacman -S devkitPPC)"),
-            (&toolchain.objcopy, "devkitPPC (pacman -S devkitPPC)"),
-            (&toolchain.elf2rpl, "wut-tools (pacman -S wut-tools)"),
-            (&toolchain.wuhbtool, "wut-tools (pacman -S wut-tools)"),
+            (&toolchain.gcc, "devkitPPC"),
+            (&toolchain.objcopy, "devkitPPC"),
+            (&toolchain.elf2rpl, "wut-tools"),
+            (&toolchain.wuhbtool, "wut-tools"),
         ];
         for (path, package) in needed {
             if !path.is_file() {
-                return Err(format!("could not find {}, which comes with {package}; set DEVKITPRO if it is elsewhere", path.display()));
+                return Err(format!(
+                    "could not find {}, which comes with {package} ({pacman} -S {package}); set DEVKITPRO if devkitPro is elsewhere{}",
+                    path.display(),
+                    if cfg!(windows) { " (C:\\devkitPro, say)" } else { "" }
+                ));
             }
         }
-        if !toolchain.wut.join("share/wut.specs").is_file() {
-            return Err(format!("could not find wut in {} (pacman -S wut)", toolchain.wut.display()));
+        if !toolchain.wut.join("share").join("wut.specs").is_file() {
+            return Err(format!("could not find wut in {} ({pacman} -S wut)", toolchain.wut.display()));
         }
-        if !toolchain.portlibs.join("lib/libSDL2.a").is_file() {
-            return Err(format!("could not find SDL2 for the Wii U in {} (pacman -S wiiu-sdl2)", toolchain.portlibs.display()));
+        if !toolchain.portlibs.join("lib").join("libSDL2.a").is_file() {
+            return Err(format!("could not find SDL2 for the Wii U in {} ({pacman} -S wiiu-sdl2)", toolchain.portlibs.display()));
         }
         Ok(toolchain)
+    }
+
+    /// a command running one of devkitPro's programs, with DEVKITPRO and
+    /// DEVKITPPC set to the folders found: wut.specs finds wut.ld through
+    /// DEVKITPRO, and the MSYS2 path the Windows installer sets would not
+    /// do for gcc run from cmd or PowerShell.
+    pub fn command(&self, program: &Path) -> Command {
+        let mut command = Command::new(program);
+        command.env("DEVKITPRO", &self.devkitpro).env("DEVKITPPC", &self.devkitppc);
+        command
     }
 
     pub fn cflags(&self) -> Vec<String> {

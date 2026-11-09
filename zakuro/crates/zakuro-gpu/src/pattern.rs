@@ -30,7 +30,7 @@ fn span(pattern: &[u8]) -> [u8; SPAN] {
 }
 
 /// whether bytes hold the pattern over and over, from its first byte.
-#[cfg(any(test, feature = "vulkan"))]
+#[cfg(any(test, hw_raster))]
 pub(crate) fn holds(bytes: &[u8], pattern: &[u8]) -> bool {
     let span = span(pattern);
     bytes.chunks(SPAN).all(|chunk| *chunk == span[..chunk.len()])

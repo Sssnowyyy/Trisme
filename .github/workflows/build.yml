@@ -1,0 +1,80 @@
+# builds and tests the host tools (3dsrecomp and the cia2wiiu converter) on
+# Linux, Windows and macOS, and on Linux builds the Wii U kit in devkitPro's
+# devkitPPC container and converts the homebrew test ROM with it.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: host tools (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            3dsrecomp -> target
+            converter -> target
+      - name: Test 3dsrecomp
+        working-directory: 3dsrecomp
+        run: cargo test --release
+      - name: Build and test the converter
+        working-directory: converter
+        run: |
+          cargo build --release
+          cargo test --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cia2wiiu-${{ runner.os }}
+          path: |
+            converter/target/release/cia2wiiu
+            converter/target/release/cia2wiiu.exe
+          if-no-files-found: error
+
+  kit:
+    name: Wii U kit (devkitPPC container)
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitppc:latest
+    steps:
+      - name: Install host packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git
+      - uses: actions/checkout@v5
+      - name: Install devkitPro packages
+        # the image has wiiu-dev (devkitPPC, wut, wut-tools); SDL2 is extra
+        run: dkp-pacman -Syu --noconfirm --needed wiiu-dev wiiu-sdl2
+      - name: Install Rust nightly with rust-src
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          "$HOME/.cargo/bin/rustup" toolchain install nightly --profile minimal -c rust-src
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build the kit
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          bash tools/build-kit.sh
+      - name: Build the converter
+        working-directory: converter
+        run: cargo build --release
+      - name: Convert the homebrew test ROM
+        run: |
+          mkdir -p out
+          converter/target/release/cia2wiiu testdata/hello-world/hello.cxi --kit kit -o out/hello.wuhb
+          converter/target/release/cia2wiiu testdata/hello-world/hello.cxi --kit kit --format wup -o out/hello_wup
+          ls -l out out/hello_wup/code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zakuro-wiiu-kit
+          path: kit

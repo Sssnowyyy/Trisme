@@ -22,14 +22,15 @@ use std::thread;
 
 use ash::vk;
 
-use super::{BoundTexture, DepthMap, DrawnTexture, Pass, Screen, Wrap, TEXTURE_UNIT_BASES};
+use super::hw::{self, Draw, Geometry, Transfer, REG_BLEND_COLOR, REG_UPDATE_BUFFER, STAGE_REGISTERS, TABLES_BYTES, UNIFORM_WORDS};
+use super::{BoundTexture, DepthMap, DrawnTexture, Pass, Screen, Wrap};
 use crate::blend::LogicOp;
 use crate::fog;
 use crate::pack::Material;
 use crate::proctex;
 use crate::{Picture, ScreenRef};
 use crate::format::{morton_offset, ColorFormat};
-use crate::lighting::{Lighting, Tables};
+use crate::lighting::Tables;
 use crate::registers::*;
 use crate::device::SharedDevice;
 use crate::shader::glsl::{self, SEMANTICS};
@@ -69,19 +70,10 @@ const RING_FLUSH: u64 = RING_SIZE / 2;
 /// a vertex is six vectors, position, color, texture coordinates 0 and 1,
 /// coordinate 2 with the mapped depth, the quaternion and the view vector.
 const VERTEX_SIZE: usize = 24 * 4;
-/// the words of a draw's uniform block, the combiners, the texture units
-/// and the flags, then the lighting.
-/// the procedural texture's registers, at the end of the uniforms.
-const PROCTEX_WORDS: usize = 8;
-/// the fog's color, and room.
-const FOG_WORDS: usize = 4;
-const UNIFORM_WORDS: usize = 12 * 4 + 4 + 3 * 4 + 4 + 328 + PROCTEX_WORDS + FOG_WORDS;
+/// a draw's uniform block, see hw::pack_uniforms.
 const UNIFORM_SIZE: u64 = (UNIFORM_WORDS * 4) as u64;
-/// 24 lighting tables of 256 entries, each a value and a step.
-/// the lighting tables, then the procedural texture's, its noise, color
-/// map and alpha map as values and steps and its colors and their steps as
-/// two pairs each, then the fog's, a value and a step an entry.
-const TABLES_SIZE: u64 = (24 * 256 + 3 * proctex::MAP_ENTRIES + 4 * proctex::COLOR_ENTRIES + fog::ENTRIES) as u64 * 8;
+/// the lighting, procedural texture and fog tables, see hw::pack_tables.
+const TABLES_SIZE: u64 = TABLES_BYTES as u64;
 /// a shader program and its operand descriptors.
 const PROGRAM_BYTES: u64 = ((PROGRAM_SIZE + DESCRIPTOR_SIZE) * 4) as u64;
 /// the words of what a vertex shader reads besides its program, the float
@@ -95,12 +87,6 @@ pub(super) const MISSING: u32 = u32::MAX;
 /// a semantic in an output attribute past the enabled registers, zero.
 pub(super) const ZERO: u32 = u32::MAX - 1;
 
-/// where each combiner stage's registers start.
-const STAGE_REGISTERS: [usize; 6] = [0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8];
-const REG_UPDATE_BUFFER: usize = 0x0E0;
-const REG_BUFFER_COLOR: usize = 0x0FD;
-const REG_BLEND_COLOR: usize = 0x103;
-
 /// the PICA's comparisons in its own order.
 const COMPARES: [vk::CompareOp; 8] = [
     vk::CompareOp::NEVER,
@@ -112,32 +98,6 @@ const COMPARES: [vk::CompareOp; 8] = [
     vk::CompareOp::GREATER,
     vk::CompareOp::GREATER_OR_EQUAL,
 ];
-
-/// what a draw needs from the rasterizer.
-pub(super) struct Draw<'a> {
-    pub(super) registers: &'a [u32],
-    pub(super) target: u32,
-    pub(super) format: ColorFormat,
-    pub(super) width: u32,
-    pub(super) height: u32,
-    /// the pixels the draw may touch, left, bottom, right and top in window
-    /// coordinates, y up.
-    pub(super) scissor: [i32; 4],
-    /// the depth and stencil buffer and its bytes per sample, when the draw
-    /// uses one.
-    pub(super) depth: Option<(u32, u32)>,
-    pub(super) depth_map: DepthMap,
-    pub(super) geometry: Geometry<'a>,
-    pub(super) textures: &'a [Option<BoundTexture>; 3],
-    pub(super) lighting: Option<&'a Lighting>,
-    pub(super) tables: &'a Tables,
-    /// whether the procedural texture is on, and its tables.
-    pub(super) proctex: bool,
-    pub(super) proctex_tables: &'a proctex::Tables,
-    /// whether the fog is on, and its table.
-    pub(super) fog: bool,
-    pub(super) fog_table: &'a fog::Table,
-}
 
 /// where something is staged in the ring, and its bytes.
 type Staged = (u64, u64);
@@ -173,16 +133,6 @@ struct Recorded {
     /// where the vertices and the indices are, for one the CPU placed.
     placed: (u64, u64),
     count: u32,
-}
-
-/// the triangles of a draw.
-#[derive(Clone, Copy)]
-pub(super) enum Geometry<'a> {
-    /// shaded, clipped and culled on the CPU, placed vertices and the
-    /// triangles, three indices each, that share them.
-    Placed { vertices: &'a [Screen], indices: &'a [u32] },
-    /// for the GPU to shade.
-    Shaded(&'a Shading<'a>),
 }
 
 /// vertices the GPU runs the vertex shader over.
@@ -753,24 +703,6 @@ struct Frame {
     ring: Buffer,
     /// the batch it holds while the GPU may still be running it.
     pending: Option<u64>,
-}
-
-/// a display transfer's registers, taken apart.
-pub(crate) struct Transfer {
-    pub(crate) input: u32,
-    pub(crate) output: u32,
-    pub(crate) input_width: u32,
-    pub(crate) output_width: u32,
-    pub(crate) output_height: u32,
-    /// the pixels written, width and height.
-    pub(crate) copy: (u32, u32),
-    /// the input pixels averaged into each output pixel, across and down.
-    pub(crate) scale: (u32, u32),
-    pub(crate) flip: bool,
-    pub(crate) input_linear: bool,
-    pub(crate) output_tiled: bool,
-    pub(crate) input_format: ColorFormat,
-    pub(crate) output_format: ColorFormat,
 }
 
 /// a compute pipeline, the shader and what it takes.
@@ -2921,24 +2853,7 @@ impl Hardware {
         }
         let offset = self.stage(TABLES_SIZE, self.storage_alignment)?;
         let staging = self.ring(offset, TABLES_SIZE);
-        let (colors, steps) = procedural.colors();
-        // a plain loop over each, which goes as fast as copying, a chain of
-        // flattened iterators took a quarter of a frame
-        let parts = [
-            tables.entries().as_flattened().as_flattened(),
-            procedural.maps().as_flattened().as_flattened(),
-            colors.as_flattened(),
-            steps.as_flattened(),
-            fog.entries().as_flattened(),
-        ];
-        let mut out = staging.as_chunks_mut::<4>().0;
-        for part in parts {
-            let (here, rest) = out.split_at_mut(part.len());
-            for (bytes, value) in here.iter_mut().zip(part) {
-                *bytes = value.to_le_bytes();
-            }
-            out = rest;
-        }
+        hw::pack_tables(tables, procedural, fog, staging.as_chunks_mut::<4>().0);
         self.tables = Some((generation, offset));
         Ok(offset)
     }
@@ -3681,17 +3596,7 @@ impl Hardware {
 
         let r = draw.registers;
         let mut block = std::mem::take(&mut self.uniforms);
-        let words = &mut block.words;
-        words.clear();
-        for base in STAGE_REGISTERS {
-            words.extend([r[base], r[base + 1], r[base + 2], r[base + 3], r[base + 4], 0, 0, 0]);
-        }
-        let texture_config = (r[REG_TEXTURE_CONFIG] & !7) | enabled;
-        words.extend([r[REG_UPDATE_BUFFER], r[REG_BUFFER_COLOR], r[REG_ALPHA_TEST], texture_config]);
-        for base in TEXTURE_UNIT_BASES {
-            words.extend([r[base + 2], r[base], 0, 0]);
-        }
-        let depth_flags = depth_map.w_buffer as u32 | (shaded.is_some() as u32) << 1;
+        let (texture_config, depth_flags) = hw::pack_uniforms(r, enabled, depth_map, shaded.is_some(), draw.lighting, &mut block.words);
         // the depth map goes through the viewport where it fits, and what
         // the CPU placed carries its depth in its position, so the fragment
         // shader leaves depth alone and the GPU skips what is hidden before
@@ -3704,22 +3609,6 @@ impl Hardware {
             Geometry::Shaded(_) if [mapped.0, mapped.1].iter().all(|d| (0.0..=1.0).contains(d)) => (false, mapped),
             Geometry::Shaded(_) => (true, (0.0, 1.0)),
         };
-        words.extend([depth_flags, draw.lighting.is_some() as u32, depth_map.scale.to_bits(), depth_map.offset.to_bits()]);
-        match draw.lighting {
-            Some(lighting) => lighting.pack(words),
-            None => words.resize(UNIFORM_WORDS - PROCTEX_WORDS - FOG_WORDS, 0),
-        }
-        let procedural = [
-            proctex::REG_CONFIG,
-            proctex::REG_CONFIG + 1,
-            proctex::REG_CONFIG + 2,
-            proctex::REG_CONFIG + 3,
-            proctex::REG_CONFIG + 4,
-            proctex::REG_CONFIG + 5,
-        ];
-        words.extend(procedural.map(|register| r[register]));
-        words.extend([0, 0]);
-        words.extend([r[fog::REG_COLOR], 0, 0, 0]);
         let uniform_offset = self.stage_block(&mut block, UNIFORM_SIZE, self.uniform_alignment);
         self.uniforms = block;
         let uniform_offset = uniform_offset?;

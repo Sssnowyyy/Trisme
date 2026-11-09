@@ -339,7 +339,7 @@ impl Gpu {
         }
         let length = (end - start) as usize;
         let address = memory.translate(start);
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.before_fill(memory, address, length as u32, if matches!(width, 2 | 3) { width } else { 4 }) {
                 log::error!("the GPU could not write back a buffer, {error}");
@@ -363,7 +363,7 @@ impl Gpu {
             }
         }
         self.fills += 1;
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             let filled = match memory.slice(address, length) {
                 Some(range) => range,
@@ -443,9 +443,9 @@ impl Gpu {
         );
 
         // what the host GPU drew it transfers itself, keeping the output
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
-            let transfer = raster::hardware::Transfer {
+            let transfer = raster::hw::Transfer {
                 input: input_base,
                 output: output_base,
                 input_width,
@@ -683,6 +683,23 @@ impl Gpu {
         Ok(name)
     }
 
+    /// draws on the Wii U's GPU through GX2 from now on, rather than in
+    /// software, the vertices still shaded on the CPU, and says so. fails
+    /// when the platform layer has no GX2 rasterizer to offer, see
+    /// platform/zw_gx2.h, or this build draws with Vulkan instead.
+    #[cfg(feature = "gx2")]
+    pub fn enable_gx2_renderer(&mut self) -> Result<String, String> {
+        #[cfg(feature = "vulkan")]
+        return Err("this build draws on the GPU through Vulkan, not GX2".into());
+        #[cfg(not(feature = "vulkan"))]
+        {
+            let hardware = raster::gx2::Hardware::new()?;
+            let name = format!("{}, vertices shaded on the CPU", hardware.name());
+            self.resources.hardware = Some(hardware);
+            Ok(name)
+        }
+    }
+
     /// draws the texture pack's pictures in place of the textures they
     /// replace, or no pack's. only the host's GPU draws them, so a pack
     /// waits for enable_hardware_renderer, and says whether it is drawn.
@@ -699,7 +716,7 @@ impl Gpu {
     /// whether the 3D is drawn on the host's GPU, enable_hardware_renderer
     /// having worked, rather than in software.
     pub fn draws_on_gpu(&self) -> bool {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if self.resources.hardware.is_some() {
             return true;
         }
@@ -709,7 +726,7 @@ impl Gpu {
     /// whether the screens the host's GPU draws are shown straight from it,
     /// by a presenter sharing its device, see screen_image.
     pub fn shows_directly(&self) -> bool {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_ref() {
             return hardware.direct();
         }
@@ -719,14 +736,14 @@ impl Gpu {
     /// where a screen's picture is on the GPU, for a presenter sharing the
     /// device to draw it straight from, the batch that drew it submitted.
     pub fn screen_image(&mut self, screen: ScreenRef) -> Option<GpuScreen> {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             match hardware.screen_image(screen) {
                 Ok(image) => return image,
                 Err(error) => log::error!("the GPU could not show a screen, {error}"),
             }
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = screen;
         None
     }
@@ -752,11 +769,11 @@ impl Gpu {
     /// draws the pictures in between from the next draw on, while the
     /// title keeps drawing a picture every other refresh, or stops.
     pub fn set_twins(&mut self, twins: bool) {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             hardware.set_twins(twins && self.interpolation.is_some());
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = twins;
     }
 
@@ -769,14 +786,14 @@ impl Gpu {
     /// where the picture in between a screen's picture and the one before
     /// is, as screen_image has the screen's, none when there is none.
     pub fn between_image(&mut self, screen: ScreenRef) -> Option<GpuScreen> {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             match hardware.between_image(screen) {
                 Ok(image) => return image,
                 Err(error) => log::error!("the GPU could not show a picture in between, {error}"),
             }
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = screen;
         None
     }
@@ -785,11 +802,11 @@ impl Gpu {
     /// the screen shows it, and the scale it is at, read back from the GPU
     /// showing the screens for saving it. it waits for the GPU.
     pub fn upright_picture(&mut self, screen: ScreenRef, between: bool) -> Option<Picture> {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             return hardware.upright_picture(screen, between);
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = (screen, between);
         None
     }
@@ -797,7 +814,7 @@ impl Gpu {
     /// how many times the console's resolution the host's GPU draws at, 1
     /// when drawing in software.
     pub fn scale(&self) -> u32 {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_ref() {
             return hardware.scale();
         }
@@ -809,11 +826,11 @@ impl Gpu {
     /// size is the pixels of a row the screen shows and its rows, stride the
     /// pixels a row takes in memory.
     pub fn scaled_screen(&mut self, addr: u32, size: (u32, u32), stride: u32, format: ColorFormat, guest: &[u8]) -> Option<ScreenRef> {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             return hardware.screen(addr, size, stride, format, guest);
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = (addr, size, stride, format, guest);
         None
     }
@@ -821,14 +838,14 @@ impl Gpu {
     /// a screen's picture upright, RGBA the way the screen shows it, and the
     /// scale it is at, once the GPU finished it.
     pub fn scaled_picture(&mut self, screen: ScreenRef) -> Option<Picture> {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             match hardware.picture(screen) {
                 Ok(picture) => return picture,
                 Err(error) => log::error!("the GPU could not show a screen, {error}"),
             }
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = screen;
         None
     }
@@ -836,13 +853,13 @@ impl Gpu {
     /// makes guest memory right over a range something other than a draw
     /// is about to read or write, the host GPU keeps what it draws until then.
     pub fn sync_memory<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.sync(memory, addr, len) {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = (memory, addr, len);
     }
 
@@ -850,13 +867,13 @@ impl Gpu {
     /// over a range, for the CPU reading there. the CPU reads color buffers
     /// as memory holds them.
     pub fn sync_depth<M: GpuMemory>(&mut self, memory: &mut M, addr: u32, len: u32) {
-        #[cfg(feature = "vulkan")]
+        #[cfg(hw_raster)]
         if let Some(hardware) = self.resources.hardware.as_mut() {
             if let Err(error) = hardware.sync_depth(memory, addr, len) {
                 log::error!("the GPU could not write back a buffer, {error}");
             }
         }
-        #[cfg(not(feature = "vulkan"))]
+        #[cfg(not(hw_raster))]
         let _ = (memory, addr, len);
     }
 

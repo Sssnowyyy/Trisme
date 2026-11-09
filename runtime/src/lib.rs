@@ -86,7 +86,9 @@ pub struct ZwParams {
     pub new3ds: u8,
     pub language: u8,
     pub region: u8,
-    pub pad_: u8,
+    /// 0 draws the 3D on the CPU, 1 on the GPU through GX2 when the
+    /// platform layer offers it.
+    pub renderer: u8,
     pub emu_core: i32,
 }
 
@@ -97,13 +99,20 @@ const _: () = {
     assert!(size_of::<ZwInput>() == 28 && offset_of!(ZwInput, touch_x) == 22);
     assert!(size_of::<ZwCode>() == 40 && offset_of!(ZwCode, entries) == 16 && offset_of!(ZwCode, present) == 36);
     assert!(size_of::<ZwParams>() == 56 && offset_of!(ZwParams, code) == 8);
-    assert!(offset_of!(ZwParams, new3ds) == 48 && offset_of!(ZwParams, emu_core) == 52);
+    assert!(offset_of!(ZwParams, new3ds) == 48 && offset_of!(ZwParams, renderer) == 51 && offset_of!(ZwParams, emu_core) == 52);
 };
 
 extern "C" {
     fn zw_platform_log(level: i32, message: *const c_char);
     fn zw_platform_thread_setup(core: i32);
+    /// platform/zw_gx2.h: 1 when the GX2 rasterizer's shaders loaded and the
+    /// main thread runs its batches.
+    fn zw_gx2_available() -> i32;
 }
+
+/// ZwParams::renderer's values.
+pub const RENDERER_CPU: u8 = 0;
+pub const RENDERER_GX2: u8 = 1;
 
 /// the newest frame, waiting for the main thread.
 struct Frame {
@@ -152,6 +161,7 @@ struct Start {
     language: Option<u8>,
     region: Option<u8>,
     core: i32,
+    renderer: u8,
 }
 
 // SAFETY: the Linked holds pointers to the recompiled code's tables, which
@@ -236,6 +246,7 @@ pub unsafe extern "C" fn zakuro_wiiu_start(params: *const ZwParams) -> i32 {
         language: (params.language != 0xFF).then_some(params.language),
         region: (params.region != 0xFF).then_some(params.region),
         core: params.emu_core,
+        renderer: params.renderer,
     };
 
     let mut thread = THREAD.lock().unwrap();
@@ -281,6 +292,7 @@ fn console(start: Start) {
         find_recompiled: false,
         recompiled: None,
         hardware_renderer: false,
+        gx2_renderer: false,
         texture_packs: false,
         interpolate: false,
         resolution: 1,
@@ -290,6 +302,22 @@ fn console(start: Start) {
     if let Some(language) = start.language {
         config.language = language;
     }
+    // the loader turns GX2 on, and says so, or why it draws on the CPU
+    config.gx2_renderer = match start.renderer {
+        RENDERER_GX2 => {
+            // SAFETY: a plain query of the platform layer
+            let available = unsafe { zw_gx2_available() } == 1;
+            if !available {
+                log::warn!("the GX2 renderer was asked for, but the platform layer has none, drawing the 3D on the CPU");
+            }
+            available
+        }
+        RENDERER_CPU => false,
+        other => {
+            log::warn!("unknown renderer {other}, drawing the 3D on the CPU");
+            false
+        }
+    };
     if let Some(region) = start.region {
         config.region = region;
     }
@@ -307,6 +335,7 @@ fn console(start: Start) {
         Ok(system) => system,
         Err(error) => return fail(format!("could not open {}, {error}", start.game.display())),
     };
+    log::info!("the 3D draws {}", if system.gpu.draws_on_gpu() { "on the GPU through GX2" } else { "on the CPU" });
     if let Some(code) = &system.recompiled {
         if code.outdated() {
             log::warn!("the recompiled code is older than this runtime expects; parts may run in the interpreter");

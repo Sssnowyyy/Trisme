@@ -50,9 +50,12 @@ pub const SYMBOLS: &[(&str, &str)] = &[
 /// the symbol natives.c adds.
 pub const NATIVES: (&str, &str) = ("recomp_natives", "uint8_t recomp_natives");
 
-/// how many objects go to ar at a time, which keeps a command line short
-/// whatever the game.
+/// how many objects go to ar at a time, and how long their names may be
+/// together, which keeps a command line well inside the 32767 characters
+/// Windows allows whatever the game and its overrides' names. the names are
+/// relative to the code folder, code123.o and hand/name.o.
 const BATCH: usize = 256;
+const BATCH_CHARS: usize = 16 << 10;
 
 /// devkitPPC's tools, found once.
 #[derive(Debug, Clone)]
@@ -63,34 +66,150 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
-    /// powerpc-eabi-gcc from WIIU_CC, $DEVKITPPC/bin, devkitPro's usual
-    /// place or the PATH, the first that runs, and its ar and nm beside it.
+    /// powerpc-eabi-gcc from WIIU_CC, devkitppc()/bin, devkitpro()'s
+    /// devkitPPC or the PATH, the first that runs, and its ar and nm beside
+    /// it.
     pub fn find() -> Result<Toolchain, String> {
+        let exe = std::env::consts::EXE_SUFFIX;
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(named) = std::env::var_os("WIIU_CC").filter(|value| !value.is_empty()) {
-            candidates.push(named.into());
+            candidates.push(host_path(&named.to_string_lossy()));
         }
-        if let Some(devkitppc) = std::env::var_os("DEVKITPPC").filter(|value| !value.is_empty()) {
-            candidates.push(Path::new(&devkitppc).join("bin/powerpc-eabi-gcc"));
-        }
-        if let Some(devkitpro) = std::env::var_os("DEVKITPRO").filter(|value| !value.is_empty()) {
-            candidates.push(Path::new(&devkitpro).join("devkitPPC/bin/powerpc-eabi-gcc"));
-        }
-        candidates.push("/opt/devkitpro/devkitPPC/bin/powerpc-eabi-gcc".into());
+        candidates.push(devkitppc().join("bin").join(format!("powerpc-eabi-gcc{exe}")));
+        candidates.push(devkitpro().join("devkitPPC").join("bin").join(format!("powerpc-eabi-gcc{exe}")));
         candidates.push("powerpc-eabi-gcc".into());
+        candidates.dedup();
         let gcc = candidates
             .into_iter()
             .map(|program| Compiler::new(program, &[]))
             .find(Compiler::runs)
-            .ok_or("there is no powerpc-eabi-gcc, install devkitPPC from devkitPro, or name it in WIIU_CC or DEVKITPPC")?;
+            .ok_or("there is no powerpc-eabi-gcc, install devkitPPC from devkitPro, or name it in WIIU_CC, DEVKITPPC or DEVKITPRO")?;
         let sibling = |tool: &str| -> PathBuf {
+            // the compiler's name with tool in place of gcc, .exe or not
+            // (Windows runs powerpc-eabi-gcc as powerpc-eabi-gcc.exe)
             let name = gcc.program.file_name().map(|name| name.to_string_lossy().replace("gcc", tool));
-            match (gcc.program.parent().filter(|dir| !dir.as_os_str().is_empty()), name) {
-                (Some(dir), Some(name)) if dir.join(&name).exists() => dir.join(name),
-                _ => format!("powerpc-eabi-{tool}").into(),
+            if let (Some(dir), Some(name)) = (gcc.program.parent().filter(|dir| !dir.as_os_str().is_empty()), name) {
+                for name in [name.clone(), format!("{name}{exe}")] {
+                    if dir.join(&name).is_file() {
+                        return dir.join(name);
+                    }
+                }
             }
+            format!("powerpc-eabi-{tool}").into()
         };
         Ok(Toolchain { ar: sibling("ar"), nm: sibling("nm"), gcc })
+    }
+}
+
+/// devkitPro's folder: DEVKITPRO, or else its usual place (/opt/devkitpro,
+/// or on Windows the folder devkitPro's MSYS2 mounts there, usually
+/// C:\devkitPro), as a path this program can open, see host_path.
+pub fn devkitpro() -> PathBuf {
+    match std::env::var_os("DEVKITPRO").filter(|value| !value.is_empty()) {
+        Some(value) => host_path(&value.to_string_lossy()),
+        None => host_path("/opt/devkitpro"),
+    }
+}
+
+/// devkitPPC's folder: DEVKITPPC, or else devkitpro()/devkitPPC.
+pub fn devkitppc() -> PathBuf {
+    match std::env::var_os("DEVKITPPC").filter(|value| !value.is_empty()) {
+        Some(value) => host_path(&value.to_string_lossy()),
+        None => devkitpro().join("devkitPPC"),
+    }
+}
+
+/// a path from the environment as this program opens it. elsewhere it is
+/// the path as it is, but on Windows devkitPro's installer sets DEVKITPRO
+/// to /opt/devkitpro, a path only the programs of its MSYS2 understand.
+/// such a path becomes a Windows one (C:/devkitPro/...): what cygpath says
+/// when it runs (from MSYS2's shell) and that is there, or else what the
+/// mounts in the fstab of devkitPro's or MSYS2's usual installation say,
+/// or else C:\devkitPro for /opt/devkitpro.
+pub fn host_path(value: &str) -> PathBuf {
+    if !cfg!(windows) || !value.starts_with('/') {
+        return value.into();
+    }
+    // another MSYS2's cygpath, Git Bash's say, maps /opt elsewhere
+    if let Some(converted) = cygpath(value).filter(|converted| Path::new(converted).exists()) {
+        return converted.into();
+    }
+    let drive = std::env::var("SystemDrive").ok().filter(|drive| drive.len() == 2).unwrap_or_else(|| "C:".to_owned());
+    let mut roots: Vec<String> = Vec::new();
+    for base in [drive.as_str(), "C:"] {
+        for root in [format!("{base}/devkitPro/msys2"), format!("{base}/msys64")] {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    let mut mounts = Vec::new();
+    for root in &roots {
+        if let Ok(fstab) = std::fs::read_to_string(Path::new(root).join("etc").join("fstab")) {
+            mounts.extend(fstab_mounts(&fstab));
+        }
+    }
+    let root = roots.iter().find(|root| Path::new(root).is_dir()).map(String::as_str);
+    windows_path(value, &mounts, root, &format!("{drive}/devkitPro")).into()
+}
+
+/// what cygpath -m makes of an MSYS2 path, when there is a cygpath to run.
+fn cygpath(value: &str) -> Option<String> {
+    let output = Command::new("cygpath").arg("-m").arg(value).stderr(std::process::Stdio::null()).output().ok()?;
+    let converted = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (output.status.success() && !converted.is_empty() && !converted.starts_with('/')).then_some(converted)
+}
+
+/// the mounts an MSYS2 or Cygwin fstab lists, (Windows folder, mount
+/// point), spaces in either written \040.
+fn fstab_mounts(fstab: &str) -> Vec<(String, String)> {
+    fstab
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(|field| field.replace("\\040", " "));
+            let (folder, point) = (fields.next()?, fields.next()?);
+            (folder != "none" && point.starts_with('/')).then(|| (folder.replace('\\', "/"), point))
+        })
+        .collect()
+}
+
+/// an MSYS2 path (value starts with /) as a Windows one with forward
+/// slashes, the way cygpath -m writes it: /c/x and /cygdrive/c/x are C:/x,
+/// a mount's point is its folder (the longest that fits first), and
+/// anything else is inside the MSYS2 root, when there is one. /opt/devkitpro
+/// with neither is devkitpro, the installer's default.
+fn windows_path(value: &str, mounts: &[(String, String)], root: Option<&str>, devkitpro: &str) -> String {
+    let under = |path: &str, prefix: &str| -> Option<String> {
+        let prefix = prefix.trim_end_matches('/');
+        let rest = path.strip_prefix(prefix)?;
+        (rest.is_empty() || rest.starts_with('/')).then(|| rest.to_owned())
+    };
+    let join = |folder: &str, rest: &str| format!("{}{rest}", folder.trim_end_matches('/'));
+    let drive = |path: &str| -> Option<String> {
+        let mut parts = path.splitn(3, '/').skip(1);
+        let letter = parts.next().filter(|part| part.len() == 1 && part.as_bytes()[0].is_ascii_alphabetic())?;
+        Some(format!("{}:/{}", letter.to_ascii_uppercase(), parts.next().unwrap_or("")))
+    };
+    if let Some(path) = value.strip_prefix("/cygdrive").filter(|path| path.starts_with('/')).and_then(drive) {
+        return path;
+    }
+    let mut mounts: Vec<&(String, String)> = mounts.iter().collect();
+    mounts.sort_by_key(|(_, point)| std::cmp::Reverse(point.len()));
+    if let Some(path) = mounts.iter().find_map(|(folder, point)| under(value, point).map(|rest| join(folder, &rest))) {
+        return path;
+    }
+    if let Some(path) = drive(value) {
+        return path;
+    }
+    if let Some(rest) = under(value, "/opt/devkitpro") {
+        // devkitPro's MSYS2 is in its folder, C:/devkitPro/msys2
+        let folder = root.and_then(|root| root.strip_suffix("/msys2")).unwrap_or(devkitpro);
+        return join(folder, &rest);
+    }
+    match root {
+        Some(root) => join(root, value),
+        None => value.to_owned(),
     }
 }
 
@@ -207,9 +326,9 @@ fn archive(ar: &Path, code: &Path, objects: &[PathBuf], library: &Path) -> Resul
         std::fs::remove_file(library).map_err(|e| format!("could not replace {}, {e}", library.display()))?;
     }
     let library = std::path::absolute(library).map_err(|e| format!("archiving failed, {e}"))?;
-    for batch in objects.chunks(BATCH) {
-        let names = batch.iter().map(|object| object.strip_prefix(code).unwrap_or(object));
-        let status = Command::new(ar).current_dir(code).arg("rcs").arg(&library).args(names).status();
+    let names: Vec<&Path> = objects.iter().map(|object| object.strip_prefix(code).unwrap_or(object)).collect();
+    for batch in batches(&names) {
+        let status = Command::new(ar).current_dir(code).arg("rcs").arg(&library).args(batch).status();
         match status {
             Ok(status) if status.success() => {}
             Ok(status) => return Err(format!("archiving with {} failed, {status}", ar.display())),
@@ -217,6 +336,25 @@ fn archive(ar: &Path, code: &Path, objects: &[PathBuf], library: &Path) -> Resul
         }
     }
     Ok(())
+}
+
+/// names in runs of at most BATCH, BATCH_CHARS long together (a quoted
+/// name and a space each), one name to a run when one is longer.
+fn batches<'a>(names: &'a [&'a Path]) -> Vec<&'a [&'a Path]> {
+    let mut batches = Vec::new();
+    let (mut start, mut chars) = (0, 0);
+    for (i, name) in names.iter().enumerate() {
+        let length = name.as_os_str().len() + 3;
+        if i > start && (i - start == BATCH || chars + length > BATCH_CHARS) {
+            batches.push(&names[start..i]);
+            (start, chars) = (i, 0);
+        }
+        chars += length;
+    }
+    if start < names.len() {
+        batches.push(&names[start..]);
+    }
+    batches
 }
 
 /// the symbols library defines, outside any object's own.
@@ -298,6 +436,45 @@ mod tests {
         assert_eq!(count(tables, "recomp_entry_count"), Some(12));
         assert_eq!(count(tables, "recomp_module_count"), Some(0));
         assert_eq!(count(tables, "recomp_abi"), None);
+    }
+
+    /// ar gets the objects in runs short enough for a Windows command line.
+    #[test]
+    fn objects_are_archived_in_short_runs() {
+        let short: Vec<PathBuf> = (0..600).map(|i| PathBuf::from(format!("code{i:03}.o"))).collect();
+        let short: Vec<&Path> = short.iter().map(PathBuf::as_path).collect();
+        let runs = batches(&short);
+        assert_eq!(runs.iter().map(|run| run.len()).collect::<Vec<_>>(), [256, 256, 88]);
+        let long: Vec<PathBuf> = (0..300).map(|i| PathBuf::from(format!("hand/{}{i}.o", "x".repeat(200)))).collect();
+        let long: Vec<&Path> = long.iter().map(PathBuf::as_path).collect();
+        let runs = batches(&long);
+        assert!(runs.iter().all(|run| run.iter().map(|name| name.as_os_str().len() + 3).sum::<usize>() <= BATCH_CHARS));
+        assert_eq!(runs.iter().map(|run| run.len()).sum::<usize>(), 300);
+        assert!(batches(&[]).is_empty());
+    }
+
+    /// devkitPro's MSYS2 paths as the Windows ones a native program opens.
+    #[test]
+    fn msys_paths_become_windows_ones() {
+        let fstab = "# comment\nnone / cygdrive binary,posix=0,noacl,user 0 0\n\
+                     D:\\dev\\040kits\\devkitPro /opt/devkitpro ntfs binary,posix=0,noacl,user 0 0 # devkitPro\n";
+        let mounts = fstab_mounts(fstab);
+        assert_eq!(mounts, vec![("D:/dev kits/devkitPro".to_owned(), "/opt/devkitpro".to_owned())]);
+        let root = Some("D:/dev kits/devkitPro/msys2");
+        assert_eq!(windows_path("/opt/devkitpro", &mounts, root, "C:/devkitPro"), "D:/dev kits/devkitPro");
+        assert_eq!(windows_path("/opt/devkitpro/devkitPPC", &mounts, root, "C:/devkitPro"), "D:/dev kits/devkitPro/devkitPPC");
+        assert_eq!(windows_path("/opt/devkitprox", &mounts, root, "C:/devkitPro"), "D:/dev kits/devkitPro/msys2/opt/devkitprox");
+        assert_eq!(windows_path("/c/Users/me", &mounts, root, "C:/devkitPro"), "C:/Users/me");
+        assert_eq!(windows_path("/cygdrive/e/x", &[], None, "C:/devkitPro"), "E:/x");
+        assert_eq!(windows_path("/usr/bin", &mounts, root, "C:/devkitPro"), "D:/dev kits/devkitPro/msys2/usr/bin");
+        // no fstab: devkitPro's MSYS2 lives in its folder, or the default
+        assert_eq!(windows_path("/opt/devkitpro/tools/bin", &[], Some("E:/devkitPro/msys2"), "C:/devkitPro"), "E:/devkitPro/tools/bin");
+        assert_eq!(windows_path("/opt/devkitpro", &[], Some("C:/msys64"), "C:/devkitPro"), "C:/devkitPro");
+        assert_eq!(windows_path("/opt/devkitpro", &[], None, "C:/devkitPro"), "C:/devkitPro");
+        // elsewhere paths stay as they are
+        if !cfg!(windows) {
+            assert_eq!(host_path("/opt/devkitpro"), PathBuf::from("/opt/devkitpro"));
+        }
     }
 
     #[test]

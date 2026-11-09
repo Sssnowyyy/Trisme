@@ -26,6 +26,7 @@ impl ScreenImage<'_> {
 /// layout, which the Vulkan presenter draws straight from when the two share
 /// a device.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
 pub struct GpuScreen {
     #[cfg(feature = "vulkan")]
     pub(crate) view: ash::vk::ImageView,
@@ -121,6 +122,7 @@ impl ScreenOrientation {
     }
 
     /// clockwise rotation in degrees
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(crate) fn clockwise_angle(&self) -> i32 {
         match self {
             ScreenOrientation::North => 0,
@@ -146,6 +148,7 @@ pub enum ScreenFilter {
 
 impl ScreenFilter {
     /// the number the present shaders know it by.
+    #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
     pub(crate) fn mode(self) -> i32 {
         match self {
             ScreenFilter::Smooth => 0,

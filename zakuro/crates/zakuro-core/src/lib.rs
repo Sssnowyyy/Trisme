@@ -56,6 +56,9 @@ pub struct Config {
     pub data_dir: Option<std::path::PathBuf>,
     /// draw on the host's GPU through Vulkan, when there is one that can.
     pub hardware_renderer: bool,
+    /// draw on the Wii U's GPU through GX2, when the platform layer offers
+    /// it, in a build with the gx2 feature.
+    pub gx2_renderer: bool,
     /// draw the pictures of the texture pack in the title's mods folder in
     /// place of its textures, which takes the host's GPU.
     pub texture_packs: bool,
@@ -108,6 +111,7 @@ impl Default for Config {
             find_recompiled: false,
             data_dir: None,
             hardware_renderer: false,
+            gx2_renderer: false,
             texture_packs: true,
             update: None,
             dlc: Vec::new(),

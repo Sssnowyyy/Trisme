@@ -7,6 +7,7 @@ const char zw_game_title[] = @TITLE@;
 const int32_t zw_game_default_layout = @LAYOUT@;
 const char zw_game_rom_name[] = @ROM_NAME@;
 const uint8_t zw_game_new3ds = @NEW3DS@;
+const uint8_t zw_game_renderer = @RENDERER@;
 
 #if @HAS_CODE@
 /* 3dsrecomp's tables, in librecomp.a; only their addresses matter here */

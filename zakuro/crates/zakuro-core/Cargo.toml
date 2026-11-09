@@ -9,6 +9,9 @@ default = ["vulkan", "jit"]
 # the GPU's Vulkan backend; a frontend drawing with the software rasterizer
 # (the Wii U's) turns default features off
 vulkan = ["zakuro-gpu/vulkan"]
+# the Wii U's GPU through GX2, see Config::gx2_renderer; the program links
+# in the platform layer's side, platform/zw_gx2.h
+gx2 = ["zakuro-gpu/gx2"]
 # shaders compiled with cranelift rather than interpreted
 jit = ["zakuro-gpu/jit"]
 
