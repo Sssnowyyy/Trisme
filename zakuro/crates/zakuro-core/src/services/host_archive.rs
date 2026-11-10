@@ -162,8 +162,8 @@ impl HostArchive {
         if !Self::parent_exists(&host) {
             return Err(errors::FS_PATH_NOT_FOUND);
         }
-        let file = std::fs::File::create(&host).map_err(io_error)?;
-        file.set_len(size).map_err(io_error)
+        let mut file = std::fs::File::create(&host).map_err(io_error)?;
+        resize(&mut file, size).map_err(io_error)
     }
 
     pub fn delete_file(&self, path: &str) -> Result<(), ResultCode> {
@@ -269,6 +269,14 @@ pub fn write_at(path: &Path, offset: u64, data: &[u8]) -> usize {
         .write(true)
         .open(path)
         .and_then(|mut file| {
+            // the Wii U's file system won't seek past the end: fill up to
+            // the offset first
+            if cfg!(target_vendor = "wiiu") {
+                let length = file.metadata()?.len();
+                if offset > length {
+                    grow(&mut file, length, offset)?;
+                }
+            }
             file.seek(SeekFrom::Start(offset))?;
             file.write_all(data)
         });
@@ -289,8 +297,38 @@ pub fn set_size(path: &Path, size: u64) -> Result<(), ResultCode> {
     std::fs::OpenOptions::new()
         .write(true)
         .open(path)
-        .and_then(|file| file.set_len(size))
+        .and_then(|mut file| resize(&mut file, size))
         .map_err(io_error)
+}
+
+/// makes a file size bytes long. growing writes zeros on the Wii U, whose
+/// file system can only truncate a file at a position (ftruncate past the
+/// end fails there, and Cemu traps on it); elsewhere set_len does both.
+fn resize(file: &mut std::fs::File, size: u64) -> std::io::Result<()> {
+    if cfg!(target_vendor = "wiiu") {
+        let length = file.metadata()?.len();
+        if size > length {
+            return grow(file, length, size);
+        }
+        if size == length {
+            return Ok(());
+        }
+    }
+    file.set_len(size)
+}
+
+/// appends zeros to a file from length to size.
+fn grow(file: &mut std::fs::File, length: u64, size: u64) -> std::io::Result<()> {
+    const CHUNK: usize = 64 << 10;
+    let zeros = [0u8; CHUNK];
+    file.seek(SeekFrom::Start(length))?;
+    let mut left = size - length;
+    while left > 0 {
+        let count = left.min(CHUNK as u64) as usize;
+        file.write_all(&zeros[..count])?;
+        left -= count as u64;
+    }
+    Ok(())
 }
 
 fn io_error(error: std::io::Error) -> ResultCode {

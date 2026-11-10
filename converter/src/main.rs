@@ -10,6 +10,7 @@
 //!    unpacked code/content/meta layout of an installed title, which --pack
 //!    packs into an installable WUP (as NUSPacker would).
 
+mod crtfix;
 mod cxi;
 mod images;
 mod nus;
@@ -326,6 +327,12 @@ fn convert(options: &Options) -> Result<(), String> {
         .arg("-o")
         .arg(&elf);
     run(&mut link, "linking")?;
+    // past 32 MiB of code the linker puts long-branch stubs inside __init
+    // and __fini, which then loop forever (see crtfix.rs)
+    let fixed = crtfix::patch_elf(&elf)?;
+    if fixed > 0 {
+        println!("    repaired {fixed} long-branch stub{} in the startup code", if fixed == 1 { "" } else { "s" });
+    }
 
     // the Rust objects carry a .note.GNU-stack section elf2rpl can't place
     let stripped = work.join("game.stripped.elf");
