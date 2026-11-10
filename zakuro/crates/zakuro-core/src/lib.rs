@@ -232,6 +232,13 @@ pub struct System {
     /// the ones recompiled code ran, to see how much the library covers.
     pub interpreted_instructions: u64,
     pub recompiled_instructions: u64,
+    /// the time recompiled code ran, svcs it ran in place and the GPU
+    /// syncs its memory accesses set off included, and how many runs.
+    pub recompiled_time: std::time::Duration,
+    pub recompiled_runs: u64,
+    /// the time the GPU's transfers, copies and fills took, which its busy
+    /// leaves out.
+    pub transfer_time: std::time::Duration,
 }
 
 /// cycles in one frame of the screens, which refresh at 268111856 / 4481136,
@@ -309,6 +316,9 @@ impl System {
             hints: None,
             interpreted_instructions: 0,
             recompiled_instructions: 0,
+            recompiled_time: std::time::Duration::ZERO,
+            recompiled_runs: 0,
+            transfer_time: std::time::Duration::ZERO,
         }
     }
 
@@ -543,9 +553,12 @@ impl System {
         // the library stays out of the system while its code runs, so that
         // an svc the code runs in place gets the system to itself
         let library = self.recompiled.take()?;
+        let started = std::time::Instant::now();
         self.sync_gpu_for_cpu();
         let (ran, stop, event) = library.run(self, budget, deadline, event);
         self.memory.clear_gpu_sync();
+        self.recompiled_time += started.elapsed();
+        self.recompiled_runs += 1;
         self.recompiled = Some(library);
         self.recompiled_instructions += ran;
         if event.is_some_and(|tick| self.cpu.cycles >= tick) {
@@ -985,7 +998,9 @@ impl System {
             linear_base,
             memory: &mut self.memory,
         };
+        let started = std::time::Instant::now();
         self.gpu.memory_fill(&mut guest, start, end, value, width);
+        self.transfer_time += started.elapsed();
     }
 
     pub fn display_transfer(
@@ -1002,6 +1017,7 @@ impl System {
             linear_base,
             memory: &mut self.memory,
         };
+        let started = std::time::Instant::now();
         self.gpu.display_transfer(
             &mut guest,
             input,
@@ -1010,6 +1026,7 @@ impl System {
             output_dimensions,
             flags,
         );
+        self.transfer_time += started.elapsed();
     }
 
     pub fn texture_copy(
@@ -1026,8 +1043,10 @@ impl System {
             linear_base,
             memory: &mut self.memory,
         };
+        let started = std::time::Instant::now();
         self.gpu
             .texture_copy(&mut guest, input, output, size, input_gap, output_gap);
+        self.transfer_time += started.elapsed();
     }
 
     /// the nine words gsp::ImportDisplayCaptureInfo returns, the addresses
@@ -1220,16 +1239,46 @@ impl System {
         let mut source = vec![0u8; source_len];
         self.memory.read_bytes(base, &mut source);
 
+        // column-major in memory, and the panel scans bottom to top. a
+        // column at a time, its pixels decoded by a loop for its format (the
+        // match outside it), which a slow CPU (the Wii U's) feels per pixel
+        let bpp32 = bpp as u32;
         for x in 0..width {
-            for y in 0..height {
-                // column-major in memory, and the panel scans bottom to top.
-                let offset = (x * stride + (height - 1 - y) * bpp as u32) as usize;
-                if offset + bpp > source.len() {
-                    continue;
+            let column = (x * stride) as usize;
+            let Some(column_bytes) = source.get(column..column + (height * bpp32) as usize) else {
+                // a stride that runs past the buffer: pixel by pixel, checked
+                for y in 0..height {
+                    let offset = column + ((height - 1 - y) * bpp32) as usize;
+                    if offset + bpp > source.len() {
+                        continue;
+                    }
+                    let pixel = format.decode(&source[offset..offset + bpp]);
+                    let dst = ((y * width + x) * 4) as usize;
+                    out[dst..dst + 4].copy_from_slice(&pixel);
                 }
-                let pixel = format.decode(&source[offset..offset + bpp]);
-                let dst = ((y * width + x) * 4) as usize;
-                out[dst..dst + 4].copy_from_slice(&pixel);
+                continue;
+            };
+            let row_bytes = (width * 4) as usize;
+            let mut dst = (x * 4) as usize + (height as usize - 1) * row_bytes;
+            match format {
+                zakuro_gpu::format::ColorFormat::Rgb8 => {
+                    for bytes in column_bytes.chunks_exact(3) {
+                        out[dst..dst + 4].copy_from_slice(&[bytes[2], bytes[1], bytes[0], 0xFF]);
+                        dst = dst.wrapping_sub(row_bytes);
+                    }
+                }
+                zakuro_gpu::format::ColorFormat::Rgba8 => {
+                    for bytes in column_bytes.chunks_exact(4) {
+                        out[dst..dst + 4].copy_from_slice(&[bytes[3], bytes[2], bytes[1], bytes[0]]);
+                        dst = dst.wrapping_sub(row_bytes);
+                    }
+                }
+                _ => {
+                    for bytes in column_bytes.chunks_exact(bpp) {
+                        out[dst..dst + 4].copy_from_slice(&format.decode(bytes));
+                        dst = dst.wrapping_sub(row_bytes);
+                    }
+                }
             }
         }
         out

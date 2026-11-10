@@ -104,12 +104,19 @@ uint32_t zakuro_wiiu_message(char *buffer, uint32_t size);
 void zakuro_wiiu_heartbeat(void);
 /* holds the console still (1) or lets it go on (0), for the HOME menu */
 void zakuro_wiiu_pause(int32_t paused);
+/* the console's frames so far, for the frame rate */
+uint32_t zakuro_wiiu_frames(void);
+/* where the console's time went over the last second, one line with a '|'
+   where it may be split in two, into buffer; its full length */
+uint32_t zakuro_wiiu_perf(char *buffer, uint32_t size);
 void zakuro_wiiu_stop(void);
 
 /* platform side (C), called by the runtime */
 void zw_platform_log(int32_t level, const char *message);
 /* called first thing on the console's thread */
 void zw_platform_thread_setup(int32_t core);
+/* called first thing on each of the GPU's worker threads, index 0 or 1 */
+void zw_platform_worker_setup(int32_t index);
 
 #ifdef __cplusplus
 }

@@ -500,7 +500,9 @@ impl Gpu {
             return;
         }
 
-        let trace_pixels = std::env::var("ZAKURO_TRACE_PIXELS").is_ok();
+        // read once: the environment is a lock and a search on some systems
+        static TRACE_PIXELS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace_pixels = *TRACE_PIXELS.get_or_init(|| std::env::var("ZAKURO_TRACE_PIXELS").is_ok());
         let mut distinct = std::collections::HashSet::new();
 
         // the input's rows are read from the first, a flip writes them from
@@ -542,7 +544,14 @@ impl Gpu {
                 if count == 0 {
                     continue;
                 }
-                let pixel = sum.map(|total| ((total + count / 2) / count) as u8);
+                // counts are 1, 2 or 4: shifts, not divides, which take a
+                // processor without a fast divider (the Wii U's) ~20 cycles each
+                let pixel = match count {
+                    1 => sum.map(|total| total as u8),
+                    2 => sum.map(|total| ((total + 1) >> 1) as u8),
+                    4 => sum.map(|total| ((total + 2) >> 2) as u8),
+                    _ => sum.map(|total| ((total + count / 2) / count) as u8),
+                };
                 if trace_pixels {
                     distinct.insert(pixel);
                 }
@@ -711,6 +720,16 @@ impl Gpu {
         let drawn = pack.is_some();
         self.resources.textures.set_pack(pack);
         drawn
+    }
+
+    /// the batches handed to the Wii U's main thread so far and the
+    /// microseconds spent waiting for it to run them, both wrapping; zeros
+    /// without GX2.
+    pub fn submit_totals(&self) -> (u32, u32) {
+        #[cfg(feature = "gx2")]
+        return raster::gx2::submit_totals();
+        #[cfg(not(feature = "gx2"))]
+        (0, 0)
     }
 
     /// whether the 3D is drawn on the host's GPU, enable_hardware_renderer

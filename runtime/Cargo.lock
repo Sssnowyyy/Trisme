@@ -887,6 +887,7 @@ name = "zakuro-wiiu-runtime"
 version = "0.1.0"
 dependencies = [
  "log",
+ "rayon",
  "zakuro-common",
  "zakuro-core",
  "zakuro-fs",

@@ -4,7 +4,10 @@
    console on a thread of its own.
 
    Right stick click (R3) on the GamePad or a Pro Controller cycles the
-   layouts; the choice is kept per game on the SD card. */
+   layouts; holding L + ZL + R + ZR + Minus shows or hides the frame rate.
+   both choices are kept per game on the SD card, in wiiu.cfg, next to
+   log.txt, which has what the program and the console said, the last run's
+   in log-previous.txt. */
 
 #include <errno.h>
 #include <stdio.h>
@@ -16,6 +19,7 @@
 #include <SDL_test_font.h>
 
 #include <coreinit/core.h>
+#include <coreinit/mutex.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
 #include <padscore/kpad.h>
@@ -43,6 +47,10 @@
    drawing the screens. measured from the present, which returns at vsync
    when it waits, so the window follows the display */
 #define SERVICE_US 14000
+/* the log file stops growing past this */
+#define LOG_MOST_BYTES (8u << 20)
+/* the buttons, all held, that show or hide the frame rate */
+#define FPS_COMBO (ZW_BTN_L | ZW_BTN_ZL | ZW_BTN_R | ZW_BTN_ZR | ZW_BTN_SELECT)
 
 static uint8_t top_pixels[ZW_TOP_WIDTH * ZW_SCREEN_HEIGHT * 4];
 static uint8_t bottom_pixels[ZW_BOTTOM_WIDTH * ZW_SCREEN_HEIGHT * 4];
@@ -59,27 +67,121 @@ static int layout = ZW_LAYOUT_SPLIT;
 /* where the 3D is drawn: 1 the GPU through GX2 when the program has the
    shaders, 0 the CPU */
 static int renderer = 1;
+/* the frame rate in a corner, and the log file */
+static int show_fps;
+static int log_enabled = 1;
+/* the core the console's thread runs on. core 1, the main thread's, has
+   2 MiB of L2 cache to the others' 512 KiB, which a big game's recompiled
+   code (tens of MiB of it) needs; the console runs under the main thread
+   there, which mostly waits for the display and the console's GX2 batches */
+static int console_core = 1;
+static int main_priority = 16;
 static char settings_path[256];
 static char toast[96];
 static int toast_frames;
 
+/* ---- the log file ----
+
+   every line WHBLog prints (the platform's and the runtime's) goes to
+   log.txt on the SD card as well, after the time since the start. lines
+   wait in a buffer the main loop writes out each second; warnings and
+   errors are written at once, so a crash right after one leaves it there. */
+
+static FILE *log_file;
+static OSMutex log_mutex;
+static OSTime log_start;
+static uint32_t log_written;
+static int log_dirty;
+
+static void log_to_file(const char *message) {
+    OSLockMutex(&log_mutex);
+    if (log_file && log_written < LOG_MOST_BYTES) {
+        uint32_t ms = (uint32_t)OSTicksToMilliseconds(OSGetSystemTime() - log_start);
+        size_t length = strlen(message);
+        int newline = length > 0 && message[length - 1] == '\n';
+        int count = fprintf(log_file, "[%5u.%03u] %s%s", ms / 1000, ms % 1000, message, newline ? "" : "\n");
+        if (count > 0) log_written += (uint32_t)count;
+        if (log_written >= LOG_MOST_BYTES) fputs("the log is full, nothing more is written\n", log_file);
+        log_dirty = 1;
+    }
+    OSUnlockMutex(&log_mutex);
+}
+
+static void log_flush(void) {
+    OSLockMutex(&log_mutex);
+    if (log_file && log_dirty) {
+        fflush(log_file);
+        log_dirty = 0;
+    }
+    OSUnlockMutex(&log_mutex);
+}
+
+/* the last run's log is kept as log-previous.txt */
+static void open_log(const char *title_dir) {
+    static char buffer[32 * 1024];
+    char path[256], previous[256];
+    snprintf(path, sizeof path, "%s/log.txt", title_dir);
+    snprintf(previous, sizeof previous, "%s/log-previous.txt", title_dir);
+    remove(previous);
+    rename(path, previous);
+    log_start = OSGetSystemTime();
+    log_file = fopen(path, "w");
+    if (!log_file) {
+        WHBLogPrintf("could not write %s (%d)", path, errno);
+        return;
+    }
+    setvbuf(log_file, buffer, _IOFBF, sizeof buffer);
+    WHBAddLogHandler(log_to_file);
+}
+
+static void close_log(void) {
+    if (!log_file) return;
+    WHBRemoveLogHandler(log_to_file);
+    OSLockMutex(&log_mutex);
+    fclose(log_file);
+    log_file = NULL;
+    OSUnlockMutex(&log_mutex);
+}
+
 /* ---- the runtime's calls into the platform ---- */
 
 void zw_platform_log(int32_t level, const char *message) {
-    (void)level;
     WHBLogPrint(message);
+    /* 1 errors, 2 warnings */
+    if (level <= 2) log_flush();
 }
 
+static const uint32_t core_affinity[3] = {
+    OS_THREAD_ATTRIB_AFFINITY_CPU0, OS_THREAD_ATTRIB_AFFINITY_CPU1, OS_THREAD_ATTRIB_AFFINITY_CPU2,
+};
+
 void zw_platform_thread_setup(int32_t core) {
-    static const uint32_t affinity[3] = {
-        OS_THREAD_ATTRIB_AFFINITY_CPU0, OS_THREAD_ATTRIB_AFFINITY_CPU1, OS_THREAD_ATTRIB_AFFINITY_CPU2,
-    };
+    OSThread *thread = OSGetCurrentThread();
     if (core >= 0 && core <= 2) {
-        OSSetThreadAffinity(OSGetCurrentThread(), affinity[core]);
+        OSSetThreadAffinity(thread, core_affinity[core]);
+        /* sharing the main thread's core, the main thread comes first (lower
+           numbers do): it runs GX2 batches the console waits on, and the
+           screens */
+        if (core == 1) OSSetThreadPriority(thread, main_priority + 1);
         /* a running thread moves at its next reschedule */
         OSYieldThread();
-        WHBLogPrintf("console thread on core %u (asked for %d)", OSGetCoreId(), core);
+        WHBLogPrintf("console thread on core %u (asked for %d), priority %d", OSGetCoreId(), core, OSGetThreadPriority(thread));
     }
+}
+
+void zw_platform_worker_setup(int32_t index) {
+    OSThread *thread = OSGetCurrentThread();
+    /* the first on core 0, which is otherwise idle; the second on the core
+       the console doesn't use of 1 and 2, below the main thread and the
+       console (lower numbers come first), so they go before it */
+    if (index == 0) {
+        OSSetThreadAffinity(thread, OS_THREAD_ATTRIB_AFFINITY_CPU0);
+    } else {
+        OSSetThreadAffinity(thread, core_affinity[console_core == 1 ? 2 : 1]);
+        OSSetThreadPriority(thread, main_priority + 4);
+    }
+    OSYieldThread();
+    WHBLogPrintf("GPU worker %d on core %u, priority %d", (int)index, OSGetCoreId(), OSGetThreadPriority(thread));
 }
 
 /* ---- settings ---- */
@@ -112,6 +214,12 @@ static void load_settings(void) {
             layout = value;
         } else if (sscanf(line, "renderer=%d", &value) == 1 && (value == 0 || value == 1)) {
             renderer = value;
+        } else if (sscanf(line, "fps=%d", &value) == 1) {
+            show_fps = value != 0;
+        } else if (sscanf(line, "log=%d", &value) == 1) {
+            log_enabled = value != 0;
+        } else if (sscanf(line, "core=%d", &value) == 1 && value >= 0 && value <= 2) {
+            console_core = value;
         }
     }
     fclose(file);
@@ -125,8 +233,11 @@ static void save_settings(void) {
     }
     fprintf(file,
             "# Zakuro for Wii U, %s\n# layout: 0 top on TV + bottom on GamePad, 1 both on TV, 2 both on GamePad\nlayout=%d\n"
-            "# renderer: 1 draws the 3D on the GPU (GX2), 0 on the CPU; read at start\nrenderer=%d\n",
-            zw_game_title, layout, renderer);
+            "# renderer: 1 draws the 3D on the GPU (GX2), 0 on the CPU; read at start\nrenderer=%d\n"
+            "# fps: 1 shows the frame rate (L + ZL + R + ZR + Minus switches it)\nfps=%d\n"
+            "# log: 1 writes log.txt next to this file; read at start\nlog=%d\n"
+            "# core: the CPU core the game runs on, 1 (the most cache) or 0 or 2; read at start\ncore=%d\n",
+            zw_game_title, layout, renderer, show_fps, log_enabled, console_core);
     fclose(file);
 }
 
@@ -192,8 +303,10 @@ static int kpad_valid[4];
 /* the last touch coordinate the panel vouched for, per axis */
 static float touch_last_x, touch_last_y;
 
-/* polls every controller; *cycle_layout is set on a fresh R3 press */
-static void poll_input(ZwInput *input, const ZwLayoutPlan *plan, int *cycle_layout) {
+/* polls every controller; *cycle_layout is set on a fresh R3 press,
+   *toggle_fps when L + ZL + R + ZR + Minus come to be held together */
+static void poll_input(ZwInput *input, const ZwLayoutPlan *plan, int *cycle_layout, int *toggle_fps) {
+    static int combo_held;
     static uint32_t last_layout_buttons;
     uint32_t layout_buttons = 0;
     VPADReadError error = VPAD_READ_NO_SAMPLES;
@@ -201,6 +314,7 @@ static void poll_input(ZwInput *input, const ZwLayoutPlan *plan, int *cycle_layo
 
     memset(input, 0, sizeof *input);
     *cycle_layout = 0;
+    *toggle_fps = 0;
 
     if (VPADRead(VPAD_CHAN_0, &fresh, 1, &error) > 0 && error == VPAD_READ_SUCCESS) {
         vpad = fresh;
@@ -258,6 +372,14 @@ static void poll_input(ZwInput *input, const ZwLayoutPlan *plan, int *cycle_layo
 
     if (layout_buttons & ~last_layout_buttons) *cycle_layout = 1;
     last_layout_buttons = layout_buttons;
+
+    /* across controllers, as the console sees them; while all five are
+       held the game sees none of them, so the combination does nothing
+       there */
+    int combo = (input->buttons & FPS_COMBO) == FPS_COMBO;
+    *toggle_fps = combo && !combo_held;
+    combo_held = combo;
+    if (combo) input->buttons &= ~FPS_COMBO;
 }
 
 /* ---- the screens ---- */
@@ -268,7 +390,11 @@ static int open_display(Display *display, const char *name, uint32_t only, int w
         WHBLogPrintf("could not open the %s window: %s", name, SDL_GetError());
         return -1;
     }
-    display->renderer = SDL_CreateRenderer(display->window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    /* only the TV's present waits for the display: the GamePad's swaps
+       with it (PREVENT_SWAP), and waiting for vsync on both halves the
+       loop to 30 Hz */
+    uint32_t flags = SDL_RENDERER_ACCELERATED | ((only & SDL_WINDOW_WIIU_GAMEPAD_ONLY) ? 0 : SDL_RENDERER_PRESENTVSYNC);
+    display->renderer = SDL_CreateRenderer(display->window, -1, flags);
     if (!display->renderer) {
         WHBLogPrintf("could not draw on the %s: %s", name, SDL_GetError());
         return -1;
@@ -346,6 +472,28 @@ static void draw_message(Display *display, const char *message, int scale) {
     }
 }
 
+/* lines of text in the top left corner, over a dark box */
+static void draw_corner(Display *display, const char *const *lines, int count, int scale) {
+    int widest = 0;
+    for (int i = 0; i < count; i++) {
+        int width = (int)strlen(lines[i]);
+        if (width > widest) widest = width;
+    }
+    if (widest == 0) return;
+    SDL_Rect box = {0, 0, widest * 8 * scale + 8 * scale, count * 10 * scale + 6 * scale};
+    SDL_SetRenderDrawBlendMode(display->renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(display->renderer, 0, 0, 0, 170);
+    SDL_RenderFillRect(display->renderer, &box);
+    SDL_RenderSetScale(display->renderer, (float)scale, (float)scale);
+    SDL_SetRenderDrawColor(display->renderer, 255, 255, 96, 255);
+    for (int i = 0; i < count; i++) SDLTest_DrawString(display->renderer, 4, 4 + i * 10, lines[i]);
+    SDL_RenderSetScale(display->renderer, 1.0f, 1.0f);
+}
+
+/* the frame rate overlay's lines, refreshed each second */
+static char fps_lines[3][160];
+static int fps_line_count;
+
 static void draw(Display *display, ZwRect top, ZwRect bottom, const char *message) {
     SDL_SetRenderDrawColor(display->renderer, 0, 0, 0, 255);
     SDL_RenderClear(display->renderer);
@@ -354,6 +502,10 @@ static void draw(Display *display, ZwRect top, ZwRect bottom, const char *messag
     int scale = display->height >= 720 ? 3 : 2;
     if (message) draw_message(display, message, scale);
     if (toast_frames > 0) draw_text(display, toast, display->height - 24 * scale, scale);
+    if (show_fps && fps_line_count > 0) {
+        const char *lines[3] = {fps_lines[0], fps_lines[1], fps_lines[2]};
+        draw_corner(display, lines, fps_line_count, display->height >= 720 ? 2 : 1);
+    }
     SDL_RenderPresent(display->renderer);
 }
 
@@ -404,6 +556,36 @@ static void reset_audio(void) {
     audio_started = 0;
 }
 
+/* ---- the frame rate ---- */
+
+/* the overlay's lines, from what the last second did: the game's frames
+   (the console's, what matters), the screens' presents, and the runtime's
+   account of where the console's time went */
+static void update_fps(OSTime elapsed, uint32_t presents) {
+    static uint32_t last_frames;
+    uint32_t frames = zakuro_wiiu_frames();
+    float seconds = (float)OSTicksToMicroseconds(elapsed) / 1e6f;
+    if (seconds <= 0.0f) return;
+    float game = (float)(frames - last_frames) / seconds;
+    last_frames = frames;
+    snprintf(fps_lines[0], sizeof fps_lines[0], "%.1f FPS  (screens %.0f, game on core %d)", game, (float)presents / seconds, console_core);
+    fps_line_count = 1;
+    char perf[sizeof fps_lines[1] * 2];
+    perf[0] = 0;
+    zakuro_wiiu_perf(perf, sizeof perf);
+    /* the runtime's account, split in two lines at the '|' it leaves */
+    if (perf[0]) {
+        char *split = strchr(perf, '|');
+        if (split) *split = 0;
+        snprintf(fps_lines[1], sizeof fps_lines[1], "%s", perf);
+        fps_line_count = 2;
+        if (split && split[1]) {
+            snprintf(fps_lines[2], sizeof fps_lines[2], "%s", split[1] == ' ' ? split + 2 : split + 1);
+            fps_line_count = 3;
+        }
+    }
+}
+
 /* ---- the game ---- */
 
 static int file_exists(const char *path) {
@@ -424,15 +606,20 @@ static int find_game(char *path, size_t size, const char *title_dir) {
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
+    OSInitMutex(&log_mutex);
     WHBLogCafeInit();
     WHBLogUdpInit();
-    WHBLogPrintf("Zakuro for Wii U: %s (%016llX)", zw_game_title, (unsigned long long)zw_game_program_id);
 
     char title_dir[160], game_path[256];
     snprintf(title_dir, sizeof title_dir, "%s/%016llX", SD_ROOT, (unsigned long long)zw_game_program_id);
     mkdirs(title_dir);
     snprintf(settings_path, sizeof settings_path, "%s/wiiu.cfg", title_dir);
     load_settings();
+    if (log_enabled) open_log(title_dir);
+    WHBLogPrintf("Zakuro for Wii U: %s (%016llX), built " __DATE__ " " __TIME__, zw_game_title, (unsigned long long)zw_game_program_id);
+    main_priority = OSGetThreadPriority(OSGetCurrentThread());
+    WHBLogPrintf("settings: layout %d, renderer %s, fps %s, core %d; main thread on core %u, priority %d", layout, renderer ? "GX2" : "CPU",
+                 show_fps ? "on" : "off", console_core, OSGetCoreId(), main_priority);
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
         WHBLogPrintf("SDL_Init: %s", SDL_GetError());
@@ -472,10 +659,10 @@ int main(int argc, char **argv) {
         params.new3ds = zw_game_new3ds;
         params.language = 0xFF;
         params.region = 0xFF;
-        /* the main thread is on core 1, with SDL and the GPU; the console
-           gets core 2 to itself, the GPU's software rasterizer threads go
-           wherever */
-        params.emu_core = 2;
+        /* the main thread is on core 1, with SDL and GX2; the console goes
+           where wiiu.cfg says, core 1 by default (see console_core), and the
+           GPU's worker threads take the others, see zw_platform_worker_setup */
+        params.emu_core = console_core;
         params.renderer = gx2 ? 1 : 0;
         if (zakuro_wiiu_start(&params) == 0) {
             started = 1;
@@ -489,6 +676,8 @@ int main(int argc, char **argv) {
     int running = 1;
     int background = 0;
     OSTime presented = 0;
+    OSTime second_start = OSGetSystemTime();
+    uint32_t presents = 0;
     while (running) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -523,6 +712,8 @@ int main(int argc, char **argv) {
             /* GX2 is the HOME menu's now: a batch the console submitted waits */
             SDL_Delay(10);
             presented = 0;
+            second_start = OSGetSystemTime();
+            presents = 0;
             continue;
         }
         zakuro_wiiu_heartbeat();
@@ -541,12 +732,18 @@ int main(int argc, char **argv) {
         zw_layout_plan(layout, tv.width, tv.height, drc.width, drc.height, &plan);
         ZwInput input;
         int cycle = 0;
-        poll_input(&input, &plan, &cycle);
+        int toggle_fps = 0;
+        poll_input(&input, &plan, &cycle, &toggle_fps);
         if (cycle) {
             layout = (layout + 1) % ZW_LAYOUT_COUNT;
             save_settings();
             show_toast(zw_layout_name(layout));
             zw_layout_plan(layout, tv.width, tv.height, drc.width, drc.height, &plan);
+        }
+        if (toggle_fps) {
+            show_fps = !show_fps;
+            save_settings();
+            show_toast(show_fps ? "Frame rate shown" : "Frame rate hidden");
         }
         zakuro_wiiu_set_input(&input);
 
@@ -560,6 +757,10 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* past the window, the console may have asked again meanwhile; a
+           batch is run between each step of the main thread's own work so
+           it waits for no more than one */
+        if (gx2) zw_gx2_service(0);
         if (zakuro_wiiu_take_frame(top_pixels, bottom_pixels)) {
             /* each display keeps its own copy, all kept current so a layout
                switched to shows the game as it is */
@@ -581,10 +782,21 @@ int main(int argc, char **argv) {
             snprintf(loading, sizeof loading, status[0] ? "Loading... %s" : "Loading...", status);
             shown = loading;
         }
+        if (gx2) zw_gx2_service(0);
         draw(&drc, plan.drc_top, plan.drc_bottom, shown);
+        if (gx2) zw_gx2_service(0);
         draw(&tv, plan.tv_top, plan.tv_bottom, shown);
         presented = OSGetSystemTime();
         if (toast_frames > 0) toast_frames--;
+        presents++;
+
+        /* once a second: the frame rates, and the log written out */
+        if (presented - second_start >= (OSTime)OSMillisecondsToTicks(1000)) {
+            update_fps(presented - second_start, presents);
+            presents = 0;
+            second_start = presented;
+            log_flush();
+        }
     }
 
     WHBLogPrint("closing");
@@ -596,6 +808,7 @@ int main(int argc, char **argv) {
     close_display(&tv);
     close_display(&drc);
     SDL_Quit();
+    close_log();
     WHBLogUdpDeinit();
     WHBLogCafeDeinit();
     return 0;

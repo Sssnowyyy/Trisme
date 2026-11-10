@@ -299,6 +299,12 @@ fn common_rules(content_group: u16, parent_title: u64) -> Vec<Rule> {
         code(Pattern::Literal("/code/cos.xml")),
         meta(Pattern::Literal("/meta/meta.xml")),
         meta(Pattern::MetaRest),
+        // a content of their own each, as Nintendo's titles have them. this
+        // also keeps a converted title at 9 contents or more, which NUSspli
+        // requires of a title.tmd (its minimal size is 9 content records)
+        meta(Pattern::Literal("/meta/iconTex.tga")),
+        meta(Pattern::Literal("/meta/bootTvTex.tga")),
+        meta(Pattern::Literal("/meta/bootDrcTex.tga")),
         meta(Pattern::Literal("/meta/bootMovie.h264")),
         meta(Pattern::Literal("/meta/bootLogoTex.tga")),
         meta(Pattern::Literal("/meta/Manual.bfma")),
@@ -416,6 +422,7 @@ impl Title {
                 }
             }
         }
+        self.drop_emptied_contents();
         for id in 1..self.nodes.len() {
             if self.nodes[id].content.is_none() {
                 return Err(if self.nodes[id].dir {
@@ -426,6 +433,57 @@ impl Title {
             }
         }
         Ok(())
+    }
+
+    /// a later rule can take every file an earlier one matched (the meta
+    /// textures from MetaRest), which leaves that content with no files: it
+    /// goes, and the rest are numbered on. a folder pointing at a content
+    /// that went takes the content of the first file within it. content 0,
+    /// the FST, always stays
+    fn drop_emptied_contents(&mut self) {
+        let count = self.contents.len();
+        let mut used = vec![false; count];
+        used[0] = true;
+        for node in &self.nodes {
+            if let (false, Some(content)) = (node.dir, node.content) {
+                used[content] = true;
+            }
+        }
+        if used.iter().all(|&u| u) {
+            return;
+        }
+        let mut renumber = vec![None; count];
+        let mut kept = Vec::with_capacity(count);
+        for (index, content) in std::mem::take(&mut self.contents).into_iter().enumerate() {
+            if used[index] {
+                renumber[index] = Some(kept.len());
+                kept.push(content);
+            }
+        }
+        self.contents = kept;
+        for id in 0..self.nodes.len() {
+            if let Some(content) = self.nodes[id].content {
+                self.nodes[id].content = match renumber[content] {
+                    Some(new) => Some(new),
+                    None => self.first_file_content(id).and_then(|old| renumber[old]),
+                };
+            }
+        }
+    }
+
+    /// the content of the first file in a folder, depth first
+    fn first_file_content(&self, id: usize) -> Option<usize> {
+        for &child in &self.nodes[id].children {
+            let node = &self.nodes[child];
+            if !node.dir {
+                if node.content.is_some() {
+                    return node.content;
+                }
+            } else if let Some(content) = self.first_file_content(child) {
+                return Some(content);
+            }
+        }
+        None
     }
 
     /// setContentRecursiveRule: the rule's files share a content (or more
@@ -1298,24 +1356,25 @@ mod tests {
         assert_eq!(wup.title_id, 0x0005_0000_10AB_CD00);
         assert_eq!(wup.group_id, 0xABCD);
         let kinds: Vec<u16> = wup.contents.iter().map(|c| c.1).collect();
-        assert_eq!(kinds, [0x2001, 0x2001, 0x2001, 0x2003, 0x2003, 0x2003, 0x2001, 0x2003]);
+        assert_eq!(kinds, [0x2001, 0x2001, 0x2001, 0x2003, 0x2003, 0x2003, 0x2003, 0x2001, 0x2003]);
         let content_of = |path: &str| (wup.files[path].0, wup.files[path].1);
         assert_eq!(content_of("code/app.xml"), (1, FLAGS_CODE));
         assert_eq!(content_of("code/cos.xml"), (2, FLAGS_CODE));
         assert_eq!(content_of("meta/meta.xml"), (3, FLAGS_META));
+        // each meta texture in a content of its own
         assert_eq!(content_of("meta/iconTex.tga"), (4, FLAGS_META));
-        assert_eq!(content_of("meta/bootTvTex.tga"), (4, FLAGS_META));
-        assert_eq!(content_of("meta/bootLogoTex.tga"), (5, FLAGS_META));
-        assert_eq!(content_of("code/game.rpx"), (6, FLAGS_CODE));
-        assert_eq!(content_of("content/game.cxi"), (7, FLAGS_CONTENT));
-        assert_eq!(content_of("content/more/notes.txt"), (7, FLAGS_CONTENT));
-        assert_eq!(wup.dirs["code"], 6);
-        assert_eq!(wup.dirs["meta"], 5);
-        assert_eq!(wup.dirs["content"], 7);
+        assert_eq!(content_of("meta/bootTvTex.tga"), (5, FLAGS_META));
+        assert_eq!(content_of("meta/bootLogoTex.tga"), (6, FLAGS_META));
+        assert_eq!(content_of("code/game.rpx"), (7, FLAGS_CODE));
+        assert_eq!(content_of("content/game.cxi"), (8, FLAGS_CONTENT));
+        assert_eq!(content_of("content/more/notes.txt"), (8, FLAGS_CONTENT));
+        assert_eq!(wup.dirs["code"], 7);
+        assert_eq!(wup.dirs["meta"], 6);
+        assert_eq!(wup.dirs["content"], 8);
         // the content's size: whole blocks and one more
         let blocks = (align(big as u64, 0x20) + 0x20) / 0xFC00 + 1;
-        assert_eq!(wup.contents[7].2, blocks * 0x10000);
-        assert_eq!(std::fs::read(out.join("00000007.h3")).unwrap().len(), 20);
+        assert_eq!(wup.contents[8].2, blocks * 0x10000);
+        assert_eq!(std::fs::read(out.join("00000008.h3")).unwrap().len(), 20);
 
         // the FST's content headers, as NUSPacker writes them
         let mut fst = std::fs::read(out.join("00000000.app")).unwrap();
@@ -1326,9 +1385,9 @@ mod tests {
         assert_eq!(be32(header(1), 0), 2);
         assert_eq!(be32(header(1), 4), 1);
         let hashed_blocks = blocks * 2;
-        assert_eq!(be32(header(7), 4) as u64, hashed_blocks - (hashed_blocks / 64 + 1) * 2);
-        assert_eq!(be64(header(7), 8), 0x0005_0000_10AB_CD00);
-        assert_eq!(be32(header(7), 0x10), 0xABCD);
+        assert_eq!(be32(header(8), 4) as u64, hashed_blocks - (hashed_blocks / 64 + 1) * 2);
+        assert_eq!(be64(header(8), 8), 0x0005_0000_10AB_CD00);
+        assert_eq!(be32(header(8), 0x10), 0xABCD);
         assert_eq!(be32(header(3), 0x10), 0x400);
 
         // the TMD carries app.xml's values
@@ -1349,7 +1408,7 @@ mod tests {
         let wup = pack_and_read(&layout, &out);
         compare(&wup, &layout);
         // 32 blocks of data, one of padding; 3 H1s, the last of nothing
-        assert_eq!(wup.contents[7].2, 33 * 0x10000);
+        assert_eq!(wup.contents.last().unwrap().2, 33 * 0x10000);
     }
 
     #[test]

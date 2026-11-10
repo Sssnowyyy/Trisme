@@ -105,6 +105,8 @@ const _: () = {
 extern "C" {
     fn zw_platform_log(level: i32, message: *const c_char);
     fn zw_platform_thread_setup(core: i32);
+    /// called first thing on each of the GPU's worker threads.
+    fn zw_platform_worker_setup(index: i32);
     /// platform/zw_gx2.h: 1 when the GX2 rasterizer's shaders loaded and the
     /// main thread runs its batches.
     fn zw_gx2_available() -> i32;
@@ -135,6 +137,8 @@ struct Shared {
     paused: AtomicBool,
     /// frames the console ran, for the log.
     frames: AtomicU32,
+    /// where the console's time went over the last second, see Perf.
+    perf: Mutex<String>,
 }
 
 fn shared() -> &'static Shared {
@@ -150,6 +154,7 @@ fn shared() -> &'static Shared {
         stop: AtomicBool::new(false),
         paused: AtomicBool::new(false),
         frames: AtomicU32::new(0),
+        perf: Mutex::new(String::new()),
     })
 }
 
@@ -212,6 +217,23 @@ fn init_logging() {
     }
 }
 
+/// the GPU's worker threads (rayon's pool, which shades vertices ahead of
+/// the console and in parallel): two, one on core 0, which nothing else
+/// uses, and one on core 1 under the main thread, which mostly waits for the
+/// display. left to themselves they land anywhere, the console's core
+/// included, where they only take turns with it.
+fn init_workers() {
+    let built = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .thread_name(|index| format!("gpu worker {index}"))
+        // SAFETY: a plain call into the platform layer
+        .start_handler(|index| unsafe { zw_platform_worker_setup(index as i32) })
+        .build_global();
+    if let Err(error) = built {
+        log::warn!("could not set up the GPU's worker threads, {error}");
+    }
+}
+
 /// a C string the platform passed, as a path.
 ///
 /// # Safety
@@ -235,6 +257,7 @@ unsafe fn path_from(pointer: *const c_char) -> Option<PathBuf> {
 pub unsafe extern "C" fn zakuro_wiiu_start(params: *const ZwParams) -> i32 {
     init_logging();
     install_panic_hook();
+    init_workers();
     let Some(params) = (unsafe { params.as_ref() }) else { return -1 };
     let Some(game) = (unsafe { path_from(params.game_path) }) else { return -2 };
     let data_dir = unsafe { path_from(params.data_dir) };
@@ -315,6 +338,61 @@ fn fail(message: String) {
     shared.state.store(STATE_FAILED, Ordering::SeqCst);
 }
 
+/// where the console's thread spent its time, summed over frames.
+#[derive(Default)]
+struct Perf {
+    frames: u32,
+    /// running the game's frames, all of it.
+    run: Duration,
+    /// of that, the GPU's command lists (zakuro-gpu's busy).
+    gpu: Duration,
+    /// of the run, recompiled code (with the svcs it runs in place and the
+    /// GPU syncs its accesses set off), and the guest instructions it ran.
+    code: Duration,
+    instructions: u64,
+    /// of the run, the GPU's transfers, copies and fills.
+    transfers: Duration,
+    /// of the run, waiting for the main thread to run GX2 batches, and how
+    /// many it was handed.
+    gx2_wait: Duration,
+    gx2_batches: u32,
+    /// reading out the screens for the main thread.
+    screens: Duration,
+    /// waiting for the next frame's turn.
+    sleep: Duration,
+    /// everything else, the audio hand-over and the locks.
+    rest: Duration,
+}
+
+impl Perf {
+    /// a line with milliseconds per frame, '|' where the overlay splits it.
+    ///
+    /// code: recompiled code; gpu: the GPU's command lists; xfer: its
+    /// transfers and fills; hle: the rest of the run, the kernel, services
+    /// and interpreter; gx2 wait: the part of those spent waiting for the
+    /// main thread to run GX2 batches; screens: reading them out.
+    fn line(&self, wall: Duration) -> String {
+        let frames = self.frames.max(1) as f64;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0 / frames;
+        let (run, code, gpu, transfers) = (ms(self.run), ms(self.code), ms(self.gpu), ms(self.transfers));
+        let per_instruction = self.code.as_secs_f64() * 1e9 / self.instructions.max(1) as f64;
+        format!(
+            "{:.0} ms/frame: code {:.0} ({:.0} ns/op), gpu {:.0}, xfer {:.0}, hle {:.0} | gx2 wait {:.0} ({:.1} batches), screens {:.1}, idle {:.0}, other {:.1}",
+            wall.as_secs_f64() * 1000.0 / frames,
+            code,
+            per_instruction,
+            gpu,
+            transfers,
+            (run - code - gpu - transfers).max(0.0),
+            ms(self.gx2_wait),
+            self.gx2_batches as f64 / frames,
+            ms(self.screens),
+            ms(self.sleep),
+            ms(self.rest),
+        )
+    }
+}
+
 /// the console's thread: loads the game and runs it, a frame at a time, at
 /// the console's pace.
 fn console(start: Start) {
@@ -389,6 +467,10 @@ fn console(start: Start) {
     let mut unshown = 0u32;
     let mut last_report = Instant::now();
     let mut frames_since = 0u32;
+    let mut perf = Perf::default();
+    let mut perf_start = Instant::now();
+    // the log's account covers a longer stretch than the overlay's second
+    let mut perf_log = Perf::default();
     while !shared.stop.load(Ordering::Relaxed) {
         // the main thread stopped coming by: the HOME menu has the console,
         // so this one waits, and starts its schedule over after
@@ -396,12 +478,24 @@ fn console(start: Start) {
         if quiet {
             std::thread::sleep(Duration::from_millis(10));
             next_frame = Instant::now();
+            perf = Perf::default();
+            perf_start = Instant::now();
             continue;
         }
 
+        let frame_start = Instant::now();
         let input = *shared.input.lock().unwrap();
         system.set_input(input);
+        let gpu_before = system.gpu.busy;
+        let code_before = (system.recompiled_time, system.recompiled_instructions, system.transfer_time);
+        let (batches_before, waited_before) = system.gpu.submit_totals();
+        let run_start = Instant::now();
         let outcome = system.run_frame();
+        let run = run_start.elapsed();
+        let gpu = system.gpu.busy.saturating_sub(gpu_before);
+        let code = system.recompiled_time.saturating_sub(code_before.0);
+        let instructions = system.recompiled_instructions.saturating_sub(code_before.1);
+        let transfers = system.transfer_time.saturating_sub(code_before.2);
         frames_since += 1;
         shared.frames.fetch_add(1, Ordering::Relaxed);
 
@@ -416,6 +510,7 @@ fn console(start: Start) {
 
         // the screens are read out when the main thread took the last ones,
         // or every few frames anyway, so falling behind costs no readouts
+        let screens_start = Instant::now();
         let taken = !shared.frame.lock().unwrap().fresh;
         if taken || unshown >= 3 {
             unshown = 0;
@@ -432,6 +527,11 @@ fn console(start: Start) {
         } else {
             unshown += 1;
         }
+        let screens = screens_start.elapsed();
+        // the screens' read-out may hand batches over too, counted with the run
+        let (batches_after, waited_after) = system.gpu.submit_totals();
+        let gx2_batches = batches_after.wrapping_sub(batches_before);
+        let gx2_wait = Duration::from_micros(waited_after.wrapping_sub(waited_before) as u64);
 
         match outcome {
             FrameOutcome::Completed => {}
@@ -453,6 +553,8 @@ fn console(start: Start) {
         if last_report.elapsed() >= Duration::from_secs(5) {
             let rate = frames_since as f32 / last_report.elapsed().as_secs_f32();
             log::info!("{rate:.1} frames a second, {}", system.status_line());
+            log::info!("{}, {} frames", perf_log.line(last_report.elapsed()).replace(" |", ","), perf_log.frames);
+            perf_log = Perf::default();
             frames_since = 0;
             last_report = Instant::now();
         }
@@ -460,10 +562,32 @@ fn console(start: Start) {
         // the console's pace: ahead of it, wait; far behind, start over
         next_frame += FRAME_TIME;
         let now = Instant::now();
+        let mut slept = Duration::ZERO;
         if now > next_frame + CATCH_UP_LIMIT {
             next_frame = now;
         } else if now < next_frame {
             std::thread::sleep(next_frame - now);
+            slept = now.elapsed();
+        }
+
+        let total = frame_start.elapsed();
+        for account in [&mut perf, &mut perf_log] {
+            account.frames += 1;
+            account.run += run;
+            account.gpu += gpu;
+            account.gx2_wait += gx2_wait;
+            account.code += code;
+            account.instructions += instructions;
+            account.transfers += transfers;
+            account.gx2_batches += gx2_batches;
+            account.screens += screens;
+            account.sleep += slept;
+            account.rest += total.saturating_sub(run + screens + slept);
+        }
+        if perf_start.elapsed() >= Duration::from_secs(1) {
+            *shared.perf.lock().unwrap() = perf.line(perf_start.elapsed());
+            perf = Perf::default();
+            perf_start = Instant::now();
         }
     }
     // the system goes here, on its own thread, and with it anything it
@@ -579,6 +703,32 @@ pub extern "C" fn zakuro_wiiu_pause(paused: i32) {
     if paused == 0 {
         zakuro_wiiu_heartbeat();
     }
+}
+
+/// the console's frames so far.
+#[no_mangle]
+pub extern "C" fn zakuro_wiiu_frames() -> u32 {
+    shared().frames.load(Ordering::Relaxed)
+}
+
+/// where the console's time went over the last second into buffer,
+/// NUL-terminated, cut to fit; its full length.
+///
+/// # Safety
+/// buffer has room for size bytes, or is null.
+#[no_mangle]
+pub unsafe extern "C" fn zakuro_wiiu_perf(buffer: *mut c_char, size: u32) -> u32 {
+    let perf = shared().perf.lock().unwrap();
+    let bytes = perf.as_bytes();
+    if !buffer.is_null() && size > 0 {
+        let count = bytes.len().min(size as usize - 1);
+        // SAFETY: count < size
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), buffer, count);
+            *buffer.add(count) = 0;
+        }
+    }
+    bytes.len() as u32
 }
 
 /// stops the console and waits for its thread, which writes out what it

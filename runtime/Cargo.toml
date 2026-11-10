@@ -18,6 +18,8 @@ zakuro-core = { path = "../zakuro/crates/zakuro-core", default-features = false,
 zakuro-common = { path = "../zakuro/crates/zakuro-common" }
 zakuro-fs = { path = "../zakuro/crates/zakuro-fs" }
 log = "0.4"
+# the GPU's worker threads, set up here to place them on the cores
+rayon = "1.12"
 
 # a project of its own, outside zakuro's workspace
 [workspace]

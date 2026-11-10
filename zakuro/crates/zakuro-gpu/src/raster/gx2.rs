@@ -170,6 +170,19 @@ const _: () = {
 };
 
 /// the platform layer's side of platform/zw_gx2.h, linked into the program.
+/// the time the console's thread spent in zw_gx2_submit, waiting for the
+/// main thread to run its batches, in microseconds, and how many it handed
+/// over, so far; see submit_totals. 32 bits, the most the Wii U's atomics
+/// take: they wrap, readers take differences with wrapping_sub.
+static SUBMIT_MICROS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SUBMITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// the batches handed to the main thread so far and the microseconds spent
+/// waiting on them, both wrapping, for an account of where the time goes.
+pub fn submit_totals() -> (u32, u32) {
+    (SUBMITS.load(std::sync::atomic::Ordering::Relaxed), SUBMIT_MICROS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 #[cfg(target_vendor = "wiiu")]
 mod ffi {
     use super::{Command, Level};
@@ -691,9 +704,13 @@ impl Hardware {
         }
         // SAFETY: the commands point at memory zw_gx2_alloc gave this batch
         // and at handles this renderer made, all there until it returns
+        let waited = std::time::Instant::now();
         let result = unsafe {
             ffi::zw_gx2_submit(self.commands.as_ptr(), self.commands.len() as u32, readback.as_ptr(), readback.len() as u32)
         };
+        let waited = waited.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        SUBMIT_MICROS.fetch_add(waited, std::sync::atomic::Ordering::Relaxed);
+        SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.commands.clear();
         self.batch += 1;
         self.uniforms_at = None;

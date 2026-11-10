@@ -46,20 +46,25 @@ fn escape(text: &str) -> String {
         .collect()
 }
 
+// the three files follow the layout of a homebrew channel that the Wii U
+// menu launches (NUSspli's): the same fields, in the same order, with the
+// same flags. an earlier, retail-shaped set installed fine but the menu
+// refused to start it (error 157-1101), so this stays close to what is
+// known to launch
+
 fn app_xml(info: &WupInfo) -> String {
     let group = (info.title_id >> 8) & 0xFFFF;
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <app type="complex" access="777">
-  <version type="unsignedInt" length="4">16</version>
+  <version type="unsignedInt" length="4">1</version>
   <os_version type="hexBinary" length="8">000500101000400A</os_version>
   <title_id type="hexBinary" length="8">{tid:016X}</title_id>
   <title_version type="hexBinary" length="2">0000</title_version>
-  <sdk_version type="unsignedInt" length="4">21204</sdk_version>
+  <sdk_version type="unsignedInt" length="4">20811</sdk_version>
   <app_type type="hexBinary" length="4">80000000</app_type>
   <group_id type="hexBinary" length="4">{group:08X}</group_id>
   <os_mask type="hexBinary" length="32">0000000000000000000000000000000000000000000000000000000000000000</os_mask>
-  <common_id type="hexBinary" length="8">0000000000000000</common_id>
 </app>
 "#,
         tid = info.title_id
@@ -70,12 +75,14 @@ fn cos_xml(info: &WupInfo) -> String {
     // the code area holds the RPX's text, the non-shared system libraries
     // (sndcore2, proc_ui, nn_*...), the compressed relocations while loading
     // and the loader's tracking: the text, a tenth more and 8 MiB, in MiB
-    // steps, within the 0x0E000000 the loader allows. no codegen area, as
-    // codegen and code together may not pass 0x0E800000, and every byte of
-    // it comes out of the data area
+    // steps, from the 16 MiB a small channel asks for up to the 0x0E000000
+    // the loader allows. no codegen area, as codegen and code together may
+    // not pass 0x0E800000, and every byte of it comes out of the data area
     let code = (info.code_size + info.code_size / 10 + (8 << 20)).next_multiple_of(1 << 20).clamp(0x0100_0000, 0x0E00_0000);
     let mut permissions = String::new();
-    for (index, group) in [1u32, 3, 9, 10, 11, 12, 13, 14, 15, 19, 20, 21, 22, 23].iter().enumerate() {
+    // BSP, DK, USB class drivers, UHS, FS, MCP, NIM, ACT, FPD, BOSS, ACP,
+    // PDM, AC, NDM and NSEC, after the base group 1
+    for (index, group) in [1u32, 3, 9, 12, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22].iter().enumerate() {
         let _ = writeln!(
             permissions,
             "    <p{index} type=\"complex\">\n      <group type=\"unsignedInt\" length=\"4\">{group}</group>\n      <mask type=\"hexBinary\" length=\"8\">FFFFFFFFFFFFFFFF</mask>\n    </p{index}>"
@@ -89,10 +96,11 @@ fn cos_xml(info: &WupInfo) -> String {
   <argstr type="string" length="4096">{rpx}</argstr>
   <avail_size type="hexBinary" length="4">00000000</avail_size>
   <codegen_size type="hexBinary" length="4">00000000</codegen_size>
-  <codegen_core type="hexBinary" length="4">80000001</codegen_core>
+  <codegen_core type="hexBinary" length="4">00000001</codegen_core>
   <max_size type="hexBinary" length="4">40000000</max_size>
   <max_codesize type="hexBinary" length="4">{code:08X}</max_codesize>
-  <overlay_arena type="hexBinary" length="4">00000000</overlay_arena>
+  <permissions type="complex">
+{permissions}  </permissions>
   <default_stack0_size type="hexBinary" length="4">00000000</default_stack0_size>
   <default_stack1_size type="hexBinary" length="4">00000000</default_stack1_size>
   <default_stack2_size type="hexBinary" length="4">00000000</default_stack2_size>
@@ -102,10 +110,6 @@ fn cos_xml(info: &WupInfo) -> String {
   <exception_stack0_size type="hexBinary" length="4">00001000</exception_stack0_size>
   <exception_stack1_size type="hexBinary" length="4">00001000</exception_stack1_size>
   <exception_stack2_size type="hexBinary" length="4">00001000</exception_stack2_size>
-  <permissions type="complex">
-{permissions}  </permissions>
-  <num_codearea_heap_blocks type="unsignedInt" length="4">0</num_codearea_heap_blocks>
-  <num_workarea_heap_blocks type="unsignedInt" length="4">0</num_workarea_heap_blocks>
 </app>
 "#,
         rpx = escape(info.rpx_name)
@@ -114,13 +118,14 @@ fn cos_xml(info: &WupInfo) -> String {
 
 fn meta_xml(info: &WupInfo) -> String {
     let tid = format!("{:016X}", info.title_id);
+    let group = (info.title_id >> 8) & 0xFFFF;
+    const LANGUAGES: [&str; 12] = ["ja", "en", "fr", "de", "it", "es", "zhs", "ko", "nl", "pt", "ru", "zht"];
     let mut names = String::new();
-    for language in ["ja", "en", "fr", "de", "it", "es", "zhs", "ko", "nl", "pt", "ru", "zht"] {
-        let _ = writeln!(names, "  <longname_{language} type=\"string\" length=\"512\">{}</longname_{language}>", escape(info.long_name));
-        let _ = writeln!(names, "  <shortname_{language} type=\"string\" length=\"256\">{}</shortname_{language}>", escape(info.short_name));
-        let _ = writeln!(names, "  <publisher_{language} type=\"string\" length=\"256\">{}</publisher_{language}>", escape(info.publisher));
+    for (tag, length, value) in [("longname", 512, info.long_name), ("shortname", 256, info.short_name), ("publisher", 256, info.publisher)] {
+        for language in LANGUAGES {
+            let _ = writeln!(names, "  <{tag}_{language} type=\"string\" length=\"{length}\">{}</{tag}_{language}>", escape(value));
+        }
     }
-    // the 32 add-on ids every retail meta.xml lists
     let mut add_ons = String::new();
     for index in 0..32 {
         let _ = writeln!(add_ons, "  <add_on_unique_id{index} type=\"hexBinary\" length=\"4\">00000000</add_on_unique_id{index}>");
@@ -131,8 +136,8 @@ fn meta_xml(info: &WupInfo) -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <menu type="complex" access="777">
-  <version type="unsignedInt" length="4">33</version>
-  <product_code type="string" length="32">WUP-N-{tail}</product_code>
+  <version type="unsignedInt" length="4">1</version>
+  <product_code type="string" length="32">WUP-P-{tail}</product_code>
   <content_platform type="string" length="32">WUP</content_platform>
   <company_code type="string" length="8">0001</company_code>
   <mastering_date type="string" length="32"></mastering_date>
@@ -140,25 +145,25 @@ fn meta_xml(info: &WupInfo) -> String {
   <app_launch_type type="hexBinary" length="4">00000000</app_launch_type>
   <invisible_flag type="hexBinary" length="4">00000000</invisible_flag>
   <no_managed_flag type="hexBinary" length="4">00000000</no_managed_flag>
-  <no_event_log type="hexBinary" length="4">00000002</no_event_log>
+  <no_event_log type="hexBinary" length="4">00000000</no_event_log>
   <no_icon_database type="hexBinary" length="4">00000000</no_icon_database>
   <launching_flag type="hexBinary" length="4">00000004</launching_flag>
   <install_flag type="hexBinary" length="4">00000000</install_flag>
-  <closing_msg type="unsignedInt" length="4">0</closing_msg>
+  <closing_msg type="unsignedInt" length="4">1</closing_msg>
   <title_version type="unsignedInt" length="4">0</title_version>
   <title_id type="hexBinary" length="8">{tid}</title_id>
   <group_id type="hexBinary" length="4">{group:08X}</group_id>
   <boss_id type="hexBinary" length="8">0000000000000000</boss_id>
   <os_version type="hexBinary" length="8">000500101000400A</os_version>
   <app_size type="hexBinary" length="8">0000000000000000</app_size>
-  <common_save_size type="hexBinary" length="8">0000000000000000</common_save_size>
+  <common_save_size type="hexBinary" length="8">0000000001790000</common_save_size>
   <account_save_size type="hexBinary" length="8">0000000000000000</account_save_size>
   <common_boss_size type="hexBinary" length="8">0000000000000000</common_boss_size>
   <account_boss_size type="hexBinary" length="8">0000000000000000</account_boss_size>
   <save_no_rollback type="unsignedInt" length="4">0</save_no_rollback>
   <join_game_id type="hexBinary" length="4">00000000</join_game_id>
   <join_game_mode_mask type="hexBinary" length="8">0000000000000000</join_game_mode_mask>
-  <bg_daemon_enable type="unsignedInt" length="4">0</bg_daemon_enable>
+  <bg_daemon_enable type="unsignedInt" length="4">1</bg_daemon_enable>
   <olv_accesskey type="unsignedInt" length="4">0</olv_accesskey>
   <wood_tin type="unsignedInt" length="4">0</wood_tin>
   <e_manual type="unsignedInt" length="4">0</e_manual>
@@ -181,28 +186,27 @@ fn meta_xml(info: &WupInfo) -> String {
   <pc_reserved2 type="unsignedInt" length="4">192</pc_reserved2>
   <pc_reserved3 type="unsignedInt" length="4">192</pc_reserved3>
   <ext_dev_nunchaku type="unsignedInt" length="4">0</ext_dev_nunchaku>
-  <ext_dev_classic type="unsignedInt" length="4">1</ext_dev_classic>
-  <ext_dev_urcc type="unsignedInt" length="4">1</ext_dev_urcc>
+  <ext_dev_classic type="unsignedInt" length="4">0</ext_dev_classic>
+  <ext_dev_urcc type="unsignedInt" length="4">0</ext_dev_urcc>
   <ext_dev_board type="unsignedInt" length="4">0</ext_dev_board>
   <ext_dev_usb_keyboard type="unsignedInt" length="4">0</ext_dev_usb_keyboard>
   <ext_dev_etc type="unsignedInt" length="4">0</ext_dev_etc>
   <ext_dev_etc_name type="string" length="512"></ext_dev_etc_name>
   <eula_version type="unsignedInt" length="4">0</eula_version>
   <drc_use type="unsignedInt" length="4">1</drc_use>
-  <network_use type="unsignedInt" length="4">0</network_use>
+  <network_use type="unsignedInt" length="4">1</network_use>
   <online_account_use type="unsignedInt" length="4">0</online_account_use>
   <direct_boot type="unsignedInt" length="4">0</direct_boot>
-  <reserved_flag0 type="hexBinary" length="4">00000000</reserved_flag0>
+  <reserved_flag0 type="hexBinary" length="4">00010002</reserved_flag0>
   <reserved_flag1 type="hexBinary" length="4">00000000</reserved_flag1>
   <reserved_flag2 type="hexBinary" length="4">00000000</reserved_flag2>
   <reserved_flag3 type="hexBinary" length="4">00000000</reserved_flag3>
   <reserved_flag4 type="hexBinary" length="4">00000000</reserved_flag4>
   <reserved_flag5 type="hexBinary" length="4">00000000</reserved_flag5>
-  <reserved_flag6 type="hexBinary" length="4">00000000</reserved_flag6>
+  <reserved_flag6 type="hexBinary" length="4">00000003</reserved_flag6>
   <reserved_flag7 type="hexBinary" length="4">00000000</reserved_flag7>
 {names}{add_ons}</menu>
-"#,
-        group = (info.title_id >> 8) & 0xFFFF
+"#
     )
 }
 
@@ -215,10 +219,9 @@ pub fn write_layout(dir: &Path, info: &WupInfo, icon: Option<&Picture>) -> Resul
     for folder in [&code, &meta, &dir.join("content")] {
         std::fs::create_dir_all(folder).map_err(|e| format!("could not create {}, {e}", folder.display()))?;
     }
-    // with the UTF-8 byte order mark Nintendo's own files start with
-    write(&code.join("app.xml"), &format!("\u{FEFF}{}", app_xml(info)))?;
-    write(&code.join("cos.xml"), &format!("\u{FEFF}{}", cos_xml(info)))?;
-    write(&meta.join("meta.xml"), &format!("\u{FEFF}{}", meta_xml(info)))?;
+    write(&code.join("app.xml"), &app_xml(info))?;
+    write(&code.join("cos.xml"), &cos_xml(info))?;
+    write(&meta.join("meta.xml"), &meta_xml(info))?;
     images::menu_icon(icon).write_tga(&meta.join("iconTex.tga"), true)?;
     images::splash(icon, 1280, 720).write_tga(&meta.join("bootTvTex.tga"), false)?;
     images::splash(icon, 854, 480).write_tga(&meta.join("bootDrcTex.tga"), false)?;
@@ -254,7 +257,7 @@ mod tests {
         let meta = meta_xml(&info);
         assert!(meta.contains("A &lt;Game&gt; &amp; more"));
         assert!(meta.contains("0005000012345600"));
-        assert!(meta.contains("WUP-N-BZLE"));
+        assert!(meta.contains("WUP-P-BZLE"));
         let cos = cos_xml(&info);
         assert!(cos.contains("<argstr type=\"string\" length=\"4096\">game.rpx</argstr>"));
         assert!(cos.contains("<max_codesize type=\"hexBinary\" length=\"4\">03400000</max_codesize>"));

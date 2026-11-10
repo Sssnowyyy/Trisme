@@ -33,6 +33,33 @@ Click the right stick (**R3**) on the GamePad or a Pro Controller to cycle throu
 | Touch screen | GamePad touch screen |
 | HOME menu | HOME button |
 | Change layout | R3 (right stick click) |
+| Show or hide the frame rate | hold L + ZL + R + ZR + − |
+
+## Frame rate, log and settings
+
+Holding **L + ZL + R + ZR + −** shows or hides the frame rate in the top left corner of both screens. The game doesn't see those buttons while all five are held. The overlay's first line is the game's frame rate, followed by how often the screens refresh. The next two lines say where the time of each game frame went, in milliseconds:
+
+| Part | What it covers |
+|---|---|
+| `code` | the recompiled game code, with its time per guest instruction |
+| `gpu` | the 3DS GPU's command lists: vertex shading and the draws handed to GX2 |
+| `xfer` | display transfers, texture copies and memory fills |
+| `hle` | the rest of the frame: the kernel, services and interpreter |
+| `gx2 wait` | the part of those spent waiting on the main thread to run GX2 work |
+| `screens` | reading out the two screens |
+| `idle` | time to spare, waiting for the next frame |
+
+Every run writes `sd:/wiiu/zakuro/<title id>/log.txt`, and the run before it is kept as `log-previous.txt`. The log has everything the program and the emulated console report. Every 5 seconds it adds the frame rate and the same breakdown as the overlay.
+
+`wiiu.cfg`, next to the log, keeps these settings. The file is written when you change the layout or the overlay; you can also edit it by hand. Lines marked "read at start" take effect the next time the game starts.
+
+| Line | Values |
+|---|---|
+| `layout=` | 0 split, 1 TV, 2 GamePad |
+| `renderer=` | 1 GPU (GX2), 0 CPU; read at start |
+| `fps=` | 1 shows the frame rate overlay |
+| `log=` | 1 writes `log.txt` (the default), 0 doesn't; read at start |
+| `core=` | the CPU core the game runs on: 1 (the default; it has 2 MiB of L2 cache against the other cores' 512 KiB), or 2 or 0; read at start |
 
 ## What you need
 
