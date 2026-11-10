@@ -58,8 +58,11 @@ impl Picture {
         }
     }
 
-    /// an uncompressed TGA, 32 bits with alpha or 24 without, rows top to
-    /// bottom, which the Wii U's meta textures and wuhbtool both take.
+    /// an uncompressed TGA, 32 bits with alpha or 24 without, the way
+    /// Nintendo's own meta textures are: rows bottom to top (descriptor 0x08
+    /// or 0x00) and the TGA 2.0 footer. the Wii U menu rejects top-down
+    /// textures without the footer: "???" for the title and an error when
+    /// it starts. wuhbtool takes these too.
     pub fn write_tga(&self, path: &Path, alpha: bool) -> Result<(), String> {
         let bytes_per_pixel = if alpha { 4 } else { 3 };
         let mut data = Vec::with_capacity(18 + self.width * self.height * bytes_per_pixel);
@@ -67,14 +70,19 @@ impl Picture {
         data.extend_from_slice(&(self.width as u16).to_le_bytes());
         data.extend_from_slice(&(self.height as u16).to_le_bytes());
         data.push(if alpha { 32 } else { 24 });
-        // top-left origin, and the alpha bits
-        data.push(0x20 | if alpha { 8 } else { 0 });
-        for pixel in &self.pixels {
-            data.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-            if alpha {
-                data.push(pixel[3]);
+        // bottom-left origin, and the alpha bits
+        data.push(if alpha { 8 } else { 0 });
+        for row in self.pixels.chunks(self.width).rev() {
+            for pixel in row {
+                data.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+                if alpha {
+                    data.push(pixel[3]);
+                }
             }
         }
+        // no extension or developer area, then the signature
+        data.extend_from_slice(&[0; 8]);
+        data.extend_from_slice(b"TRUEVISION-XFILE.\0");
         std::fs::write(path, data).map_err(|e| format!("could not write {}, {e}", path.display()))
     }
 }
@@ -198,11 +206,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cia2wiiu-tga-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.tga");
-        Picture::filled(3, 2, [1, 2, 3, 4]).write_tga(&path, true).unwrap();
+        let mut picture = Picture::filled(3, 2, [1, 2, 3, 4]);
+        picture.pixels[0] = [9, 8, 7, 6]; // top left
+        picture.write_tga(&path, true).unwrap();
         let data = std::fs::read(&path).unwrap();
-        assert_eq!(data.len(), 18 + 3 * 2 * 4);
-        assert_eq!(&data[12..16], &[3, 0, 2, 0]);
+        assert_eq!(data.len(), 18 + 3 * 2 * 4 + 26);
+        assert_eq!(&data[12..18], &[3, 0, 2, 0, 32, 0x08]);
+        // the bottom row first, BGRA
         assert_eq!(&data[18..22], &[3, 2, 1, 4]);
+        assert_eq!(&data[18 + 12..18 + 16], &[7, 8, 9, 6]);
+        assert_eq!(&data[data.len() - 18..], b"TRUEVISION-XFILE.\0");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

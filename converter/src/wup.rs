@@ -104,6 +104,8 @@ fn cos_xml(info: &WupInfo) -> String {
   <exception_stack2_size type="hexBinary" length="4">00001000</exception_stack2_size>
   <permissions type="complex">
 {permissions}  </permissions>
+  <num_codearea_heap_blocks type="unsignedInt" length="4">0</num_codearea_heap_blocks>
+  <num_workarea_heap_blocks type="unsignedInt" length="4">0</num_workarea_heap_blocks>
 </app>
 "#,
         rpx = escape(info.rpx_name)
@@ -117,6 +119,11 @@ fn meta_xml(info: &WupInfo) -> String {
         let _ = writeln!(names, "  <longname_{language} type=\"string\" length=\"512\">{}</longname_{language}>", escape(info.long_name));
         let _ = writeln!(names, "  <shortname_{language} type=\"string\" length=\"256\">{}</shortname_{language}>", escape(info.short_name));
         let _ = writeln!(names, "  <publisher_{language} type=\"string\" length=\"256\">{}</publisher_{language}>", escape(info.publisher));
+    }
+    // the 32 add-on ids every retail meta.xml lists
+    let mut add_ons = String::new();
+    for index in 0..32 {
+        let _ = writeln!(add_ons, "  <add_on_unique_id{index} type=\"hexBinary\" length=\"4\">00000000</add_on_unique_id{index}>");
     }
     // a product code of the Wii U's shape, from the 3DS one's last letters
     let code: String = info.product_code.chars().filter(char::is_ascii_alphanumeric).collect();
@@ -193,8 +200,7 @@ fn meta_xml(info: &WupInfo) -> String {
   <reserved_flag5 type="hexBinary" length="4">00000000</reserved_flag5>
   <reserved_flag6 type="hexBinary" length="4">00000000</reserved_flag6>
   <reserved_flag7 type="hexBinary" length="4">00000000</reserved_flag7>
-{names}  <add_on_unique_id0 type="hexBinary" length="4">00000000</add_on_unique_id0>
-</menu>
+{names}{add_ons}</menu>
 "#,
         group = (info.title_id >> 8) & 0xFFFF
     )
@@ -209,9 +215,10 @@ pub fn write_layout(dir: &Path, info: &WupInfo, icon: Option<&Picture>) -> Resul
     for folder in [&code, &meta, &dir.join("content")] {
         std::fs::create_dir_all(folder).map_err(|e| format!("could not create {}, {e}", folder.display()))?;
     }
-    write(&code.join("app.xml"), &app_xml(info))?;
-    write(&code.join("cos.xml"), &cos_xml(info))?;
-    write(&meta.join("meta.xml"), &meta_xml(info))?;
+    // with the UTF-8 byte order mark Nintendo's own files start with
+    write(&code.join("app.xml"), &format!("\u{FEFF}{}", app_xml(info)))?;
+    write(&code.join("cos.xml"), &format!("\u{FEFF}{}", cos_xml(info)))?;
+    write(&meta.join("meta.xml"), &format!("\u{FEFF}{}", meta_xml(info)))?;
     images::menu_icon(icon).write_tga(&meta.join("iconTex.tga"), true)?;
     images::splash(icon, 1280, 720).write_tga(&meta.join("bootTvTex.tga"), false)?;
     images::splash(icon, 854, 480).write_tga(&meta.join("bootDrcTex.tga"), false)?;

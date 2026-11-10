@@ -1065,13 +1065,14 @@ mod tests {
             return Err("bad TMD header".into());
         }
         let count = be16(&tmd, 0x1DE) as usize;
-        if tmd.len() != 0xB04 + count * 0x30 {
+        // retail TMDs carry their certificate chain after the records
+        if tmd.len() < 0xB04 + count * 0x30 {
             return Err("bad TMD size".into());
         }
         if Sha256::digest(&tmd[0x204..0xB04]).as_slice() != &tmd[0x1E4..0x204] {
             return Err("TMD content info hash".into());
         }
-        if be16(&tmd, 0x204) != 0 || be16(&tmd, 0x206) as usize != count || Sha256::digest(&tmd[0xB04..]).as_slice() != &tmd[0x208..0x228] {
+        if be16(&tmd, 0x204) != 0 || be16(&tmd, 0x206) as usize != count || Sha256::digest(&tmd[0xB04..0xB04 + count * 0x30]).as_slice() != &tmd[0x208..0x228] {
             return Err("TMD content info 0".into());
         }
         if tmd[0x228..0xB04].iter().any(|&b| b != 0) {
@@ -1083,7 +1084,8 @@ mod tests {
         for i in 0..count {
             let record = &tmd[0xB04 + i * 0x30..0xB04 + (i + 1) * 0x30];
             let (id, index, kind, size) = (be32(record, 0), be16(record, 4), be16(record, 6), be64(record, 8));
-            if id as usize != i || index as usize != i {
+            // ours number contents 0, 1, 2...; a retail title's ids are its own
+            if index as usize != i {
                 return Err(format!("content {i} has id {id:X} index {index:X}"));
             }
             let mut app = read(&format!("{id:08X}.app"))?;
@@ -1414,7 +1416,11 @@ mod tests {
         let var = |name: &str| PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("set {name}")));
         let key = read_key_file(&var("NUS_VERIFY_KEY")).unwrap();
         let wup = read_wup(&var("NUS_VERIFY_WUP"), &key).unwrap();
-        compare(&wup, &var("NUS_VERIFY_LAYOUT"));
+        // without a layout, only the WUP's own hashes are checked (a retail
+        // title can be read this way, to check the reader against the real format)
+        if std::env::var_os("NUS_VERIFY_LAYOUT").is_some() {
+            compare(&wup, &var("NUS_VERIFY_LAYOUT"));
+        }
         for (id, kind, size) in &wup.contents {
             println!("{id:08X}.app type {kind:04X} {size} bytes");
         }
