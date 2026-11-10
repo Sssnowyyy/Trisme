@@ -53,9 +53,16 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends build-essential ca-certificates curl git
       - uses: actions/checkout@v5
-      - name: Install devkitPro packages
-        # the image has wiiu-dev (devkitPPC, wut, wut-tools); SDL2 is extra
-        run: dkp-pacman -Syu --noconfirm --needed wiiu-dev wiiu-sdl2
+      - name: Check devkitPro packages
+        # the image already carries wiiu-dev (devkitPPC, wut, wut-tools) and
+        # wiiu-sdl2. pkg.devkitpro.org refuses (403) many requests from CI
+        # runners, so it's only asked when something is actually missing
+        run: |
+          if [ -f "$DEVKITPRO/wut/include/wut.h" ] && [ -f "$DEVKITPRO/portlibs/wiiu/include/SDL2/SDL.h" ]; then
+            echo "wut and wiiu-sdl2 are in the image"
+          else
+            dkp-pacman -Sy --noconfirm --needed wiiu-dev wiiu-sdl2
+          fi
       - name: Install Rust nightly with rust-src
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
