@@ -686,7 +686,86 @@ static void leave_gpu(void) {
     GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_REGISTER);
 }
 
+/* ---- diagnostics ----
+   a sample of batches is written to the log (OSReport, which Cemu records
+   with Coreinit logging on): each draw's state and the combiner registers
+   from its uniform block, then what the CPU reads back from each color
+   buffer. off unless built with -DZW_GX2_DIAG=1 */
+#ifndef ZW_GX2_DIAG
+#define ZW_GX2_DIAG 0
+#endif
+#define DIAG_EVERY 48u
+#define DIAG_BATCHES 40u
+#define DIAG_COMMANDS 24u
+
+static uint32_t batch_counter, diag_logged;
+
+static uint32_t le_word(const void *base, uint32_t index) {
+    const uint8_t *b = (const uint8_t *)base + index * 4;
+    return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+}
+
+static void diag_command(uint32_t index, const ZwGx2Command *c) {
+    if (c->kind != ZW_GX2_CMD_DRAW) {
+        WHBLogPrintf("gx2diag  %u: kind %u color %u depth %u clear %.3f %.3f %.3f %.3f depth %.4f stencil %u flags %u", index, c->kind,
+                     c->color, c->depth, c->clear_color[0], c->clear_color[1], c->clear_color[2], c->clear_color[3], c->clear_depth,
+                     c->clear_stencil, c->clear_flags);
+        return;
+    }
+    Object *color = object(c->color);
+    WHBLogPrintf("gx2diag  %u: draw color %u (%ux%u) depth %u scissor %d,%d-%d,%d shader %u verts %u idx %u tex %u,%u,%u", index, c->color,
+                 color ? color->color.surface.width : 0, color ? color->color.surface.height : 0, c->depth, c->scissor[0], c->scissor[1],
+                 c->scissor[2], c->scissor[3], c->shader, c->vertex_count, c->index_count, c->textures[0], c->textures[1], c->textures[2]);
+    WHBLogPrintf("gx2diag     mask %x depth test %u func %u write %u stencil %u func %u ref %u blend %u eq %u/%u f %u,%u/%u,%u const %08x logic %u/%u",
+                 c->color_mask, c->depth_test, c->depth_func, c->depth_write, c->stencil_test, c->stencil_func, c->stencil_ref, c->blend_enable,
+                 c->blend_eq_rgb, c->blend_eq_alpha, c->blend_src_rgb, c->blend_dst_rgb, c->blend_src_alpha, c->blend_dst_alpha, c->blend_color,
+                 c->logic_op_enable, c->logic_op);
+    if (c->uniforms) {
+        const void *u = c->uniforms;
+        for (uint32_t stage = 0; stage < 6; stage++) {
+            WHBLogPrintf("gx2diag     tev%u src %08x op %08x comb %08x const %08x scale %08x", stage, le_word(u, stage * 8), le_word(u, stage * 8 + 1),
+                         le_word(u, stage * 8 + 2), le_word(u, stage * 8 + 3), le_word(u, stage * 8 + 4));
+        }
+        WHBLogPrintf("gx2diag     misc update %08x bufcolor %08x alpha %08x texcfg %08x units %08x %08x %08x flags %08x %08x %08x %08x",
+                     le_word(u, 48), le_word(u, 49), le_word(u, 50), le_word(u, 51), le_word(u, 52), le_word(u, 56), le_word(u, 60), le_word(u, 64),
+                     le_word(u, 65), le_word(u, 66), le_word(u, 67));
+    }
+    if (c->vertices && c->vertex_count) {
+        const float *v = (const float *)c->vertices;
+        WHBLogPrintf("gx2diag     v0 pos %.3f %.3f %.3f %.3f col %.3f %.3f %.3f %.3f tc %.3f %.3f %.3f %.3f d %.4f", v[0], v[1], v[2], v[3], v[4], v[5],
+                     v[6], v[7], v[8], v[9], v[10], v[11], v[14]);
+    }
+}
+
+static void diag_readback(uint32_t handle) {
+    Object *o = object(handle);
+    if (!o || o->kind != OBJ_COLOR) return;
+    const uint8_t *px = o->color.surface.image;
+    uint32_t pitch = o->color.surface.pitch, width = o->color.surface.width, height = o->color.surface.height;
+    uint32_t nonzero = 0, samples = 0, firsts[4] = {0}, counts[4] = {0}, used = 0;
+    for (uint32_t y = 0; y < height; y += 3) {
+        for (uint32_t x = 0; x < width; x += 3) {
+            const uint8_t *p = px + (y * pitch + x) * 4;
+            uint32_t value = (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+            samples++;
+            if (value) nonzero++;
+            uint32_t k = 0;
+            while (k < used && firsts[k] != value) k++;
+            if (k < used) counts[k]++;
+            else if (used < 4) { firsts[used] = value; counts[used++] = 1; }
+        }
+    }
+    WHBLogPrintf("gx2diag  readback %u (%ux%u): %u of %u sampled pixels non-zero; RGBA %08x x%u %08x x%u %08x x%u %08x x%u", handle, width, height,
+                 nonzero, samples, firsts[0], counts[0], firsts[1], counts[1], firsts[2], counts[2], firsts[3], counts[3]);
+}
+
 static void run_batch(const ZwGx2Command *commands, uint32_t count, const uint32_t *readback, uint32_t readback_count) {
+    int diag = ZW_GX2_DIAG && batch_counter++ % DIAG_EVERY == 5 && diag_logged < DIAG_BATCHES;
+    if (diag) {
+        diag_logged++;
+        WHBLogPrintf("gx2diag batch %u: %u commands, %u read back", batch_counter - 1, count, readback_count);
+        for (uint32_t i = 0; i < count && i < DIAG_COMMANDS; i++) diag_command(i, &commands[i]);
+    }
     GX2SetContextState(context);
     for (uint32_t i = 0; i < MAX_OBJECTS; i++) {
         if (objects[i].kind != OBJ_FREE && objects[i].written) publish(&objects[i]);
@@ -741,6 +820,9 @@ static void run_batch(const ZwGx2Command *commands, uint32_t count, const uint32
     for (uint32_t i = 0; i < readback_count; i++) {
         Object *color = object(readback[i]);
         if (color && color->kind == OBJ_COLOR) DCInvalidateRange(color->color.surface.image, color->color.surface.imageSize);
+    }
+    if (diag) {
+        for (uint32_t i = 0; i < readback_count; i++) diag_readback(readback[i]);
     }
 }
 

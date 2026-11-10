@@ -265,7 +265,10 @@ pub fn read_at(path: &Path, offset: u64, buffer: &mut [u8]) -> usize {
 
 /// writes data at offset, growing the file if needed.
 pub fn write_at(path: &Path, offset: u64, data: &[u8]) -> usize {
+    // read too: wut opens write-only files only to create, truncate or
+    // append them; read and write is the Wii U's "r+", in place
     let result = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(path)
         .and_then(|mut file| {
@@ -295,6 +298,7 @@ pub fn size_of(path: &Path) -> u64 {
 
 pub fn set_size(path: &Path, size: u64) -> Result<(), ResultCode> {
     std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open(path)
         .and_then(|mut file| resize(&mut file, size))
